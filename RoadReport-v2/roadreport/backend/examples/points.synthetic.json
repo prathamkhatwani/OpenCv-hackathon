@@ -1,0 +1,59 @@
+{
+  "image_points_normalized": [
+    [
+      0.2,
+      0.5
+    ],
+    [
+      0.5,
+      0.5
+    ],
+    [
+      0.8,
+      0.5
+    ],
+    [
+      0.2,
+      0.8
+    ],
+    [
+      0.5,
+      0.8
+    ],
+    [
+      0.8,
+      0.8
+    ]
+  ],
+  "ground_points_m": [
+    [
+      -3,
+      10
+    ],
+    [
+      0,
+      10
+    ],
+    [
+      3,
+      10
+    ],
+    [
+      -3,
+      4
+    ],
+    [
+      0,
+      4
+    ],
+    [
+      3,
+      4
+    ]
+  ],
+  "camera_id": "synthetic",
+  "calibration_note": "Synthetic correspondences, not measured calibration",
+  "track_width_m": 1.5,
+  "tyre_width_m": 0.22,
+  "wheelbase_m": 2.6
+}

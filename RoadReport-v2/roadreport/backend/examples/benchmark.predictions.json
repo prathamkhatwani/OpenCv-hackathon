@@ -1,0 +1,18 @@
+[
+  {
+    "prediction_id": "candidate-a",
+    "event_id": "defect-1",
+    "vision_positive": true,
+    "shock_positive": false,
+    "fusion_positive": true,
+    "needs_review": false
+  },
+  {
+    "prediction_id": "candidate-b",
+    "event_id": null,
+    "vision_positive": false,
+    "shock_positive": true,
+    "fusion_positive": false,
+    "needs_review": false
+  }
+]

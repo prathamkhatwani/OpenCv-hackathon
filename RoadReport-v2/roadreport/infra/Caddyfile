@@ -1,0 +1,11 @@
+# Replace domain; run Caddy on the EC2 host. DNS must point to its public IP.
+your-domain.example {
+    request_body {
+        max_size 105MB
+    }
+    reverse_proxy 127.0.0.1:8000 {
+        transport http {
+            response_header_timeout 180s
+        }
+    }
+}

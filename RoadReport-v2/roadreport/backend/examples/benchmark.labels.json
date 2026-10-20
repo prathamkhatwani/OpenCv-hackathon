@@ -1,0 +1,12 @@
+[
+  {
+    "event_id": "defect-1",
+    "pothole_exists": 1,
+    "contact_label": "no"
+  },
+  {
+    "event_id": "missed-2",
+    "pothole_exists": 1,
+    "contact_label": "yes"
+  }
+]

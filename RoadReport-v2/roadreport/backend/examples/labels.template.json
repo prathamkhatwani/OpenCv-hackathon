@@ -1,0 +1,12 @@
+[
+  {
+    "event_id": "REPLACE_WITH_FINDING_UUID",
+    "drive_id": "drive-001",
+    "site_id": "site-001",
+    "split": "train",
+    "pothole_exists": 1,
+    "impact_associated": 0,
+    "contact_label": "no",
+    "source_kind": "real"
+  }
+]

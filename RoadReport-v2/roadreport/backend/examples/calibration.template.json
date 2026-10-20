@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "homography": [
+    [
+      10,
+      0,
+      -5
+    ],
+    [
+      0,
+      -20,
+      20
+    ],
+    [
+      0,
+      0,
+      1
+    ]
+  ],
+  "straight_path_valid": false,
+  "camera_id": "REPLACE_WITH_MEASURED_CAMERA",
+  "calibration_note": "Synthetic template; never enable unchanged on real footage",
+  "track_width_m": 1.5,
+  "tyre_width_m": 0.22,
+  "wheelbase_m": 2.6,
+  "lateral_uncertainty_m": 0.15,
+  "timing_uncertainty_s": 0.25
+}
