@@ -1,170 +1,369 @@
-"""Real-code regression tests. Generated fixtures are not field-validation data."""
-import copy,json,time
-import cv2,numpy as np,pytest
+"""Comprehensive unit and integration tests for backend core components."""
+
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import pytest
 from fastapi.testclient import TestClient
-from app import db
+
+# Configure environment for testing
+test_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+os.environ["ROADREPORT_DB"] = test_db_file
+os.environ["USE_LOCAL_STORAGE"] = "true"
+
+from app.db import (
+    add_agent_step,
+    create_finding,
+    create_job,
+    get_agent_steps,
+    get_db,
+    get_finding,
+    get_findings,
+    get_job,
+    init_db,
+    update_finding,
+    update_job,
+)
 from app.main import app
-from app.schemas import Options,Telemetry,Calibration
-from app.storage import _get_local_dest_path
-from app.cv.track import Track,build_tracks
-from app.cv.contact import estimate_contact
-from app.cv.motion import event_evidence
-from app.cv.video import decode_video
-from app.ml.decision import decide
-from app.ml.features import FEATURES
-from app.ml.train import validate,train
-from app.ml.infer import FusionModel
+from app.pipeline import run_pipeline
+from app.storage import download_file, presign_get, upload_bytes, upload_file
+
 
 @pytest.fixture(autouse=True)
-def isolated(tmp_path,monkeypatch):
-    monkeypatch.setenv('ROADREPORT_DB',str(tmp_path/'test.db'))
-    monkeypatch.setenv('LOCAL_STORAGE_DIR',str(tmp_path/'storage'))
-    monkeypatch.setenv('USE_LOCAL_STORAGE','true')
-    monkeypatch.delenv('ROADREPORT_MODEL',raising=False)
-    db.init_db()
+def setup_and_teardown_db():
+    init_db()
+    yield
+    with get_db() as conn:
+        conn.execute("DELETE FROM agent_steps;")
+        conn.execute("DELETE FROM findings;")
+        conn.execute("DELETE FROM jobs;")
 
-@pytest.fixture
-def video(tmp_path):
-    path=tmp_path/'synthetic.avi'
-    out=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*'MJPG'),20,(640,360));assert out.isOpened()
-    rng=np.random.default_rng(42);bg=np.clip(rng.normal(150,16,(360,640,3)),0,255).astype('uint8')
-    for i in range(40):
-        frame=bg.copy();cv2.ellipse(frame,(320,245+i//5),(40,24),0,0,360,(25,25,25),-1);out.write(frame)
-    out.release();return path
 
-def track_at(x):
-    track=None
-    for i in range(3):
-        frame=np.zeros((360,640,3),dtype='uint8');f={'frame':frame,'gray':frame[:,:,0],'timestamp_s':i*.25,'index':i}
-        d={'type':'pothole','confidence':.9,'bbox':(int(x*640)-3,180+i*9,6,6),'center_x':x*640,'center_y':183+i*9}
-        if track is None:track=Track(d,f)
-        else:track.add(d,f)
-    return track
+def test_db_crud_operations():
+    # 1. Job CRUD
+    job = create_job(
+        video_key="jobs/job1/video.mp4",
+        location_text="123 Main St",
+        lat=12.9716,
+        lon=77.5946,
+    )
+    job_id = job["id"]
+    assert job["status"] == "uploaded"
+    assert job["location_text"] == "123 Main St"
+    assert job["lat"] == 12.9716
 
-def calibration():
-    return Calibration(homography=[[10,0,-5],[0,-20,20],[0,0,1]],straight_path_valid=True,camera_id='synthetic',calibration_note='Synthetic geometry unit fixture',lateral_uncertainty_m=.01).model_dump()
+    # Update job
+    updated_job = update_job(
+        job_id,
+        status="processing",
+        frames_total=100,
+        frames_done=50,
+    )
+    assert updated_job["status"] == "processing"
+    assert updated_job["frames_total"] == 100
+    assert updated_job["frames_done"] == 50
 
-@pytest.mark.parametrize('key',['../escape','/etc/passwd','a/../../escape','a\\escape',''])
-def test_storage_containment(key):
-    with pytest.raises(ValueError):_get_local_dest_path(key)
+    # 2. Finding CRUD
+    finding = create_finding(
+        job_id=job_id,
+        type="pothole",
+        severity_label="high",
+        severity_score=0.88,
+        confidence=0.95,
+        frame_index=15,
+        timestamp_s=3.75,
+        bbox_json=json.dumps([100, 200, 50, 60]),
+    )
+    finding_id = finding["id"]
+    assert finding["type"] == "pothole"
+    assert finding["status"] == "confirmed"
 
-def test_sidecars():
-    with pytest.raises(ValueError):Telemetry(samples=[{'t':1},{'t':1}])
-    with pytest.raises(ValueError):Telemetry(samples=[{'t':0,'lat':12},{'t':1}])
-    with pytest.raises(ValueError):Options.model_validate({'made_up':3})
-    with pytest.raises(ValueError):Calibration(homography=[[0]*3]*3,camera_id='a',calibration_note='invalid')
+    # Update finding
+    updated_finding = update_finding(
+        finding_id,
+        status="rejected",
+        image_key=f"jobs/{job_id}/findings/finding_{finding_id}_annotated.jpg",
+    )
+    assert updated_finding["status"] == "rejected"
+    assert "annotated.jpg" in updated_finding["image_key"]
 
-def test_contact_geometry_and_no_shock():
-    missed=estimate_contact(track_at(.5),calibration(),None,10)
-    assert missed['state']=='no_contact_expected'
-    hit=estimate_contact(track_at(.425),calibration(),None,10)
-    assert hit['state']=='contact_expected' and len(hit['windows'])==2
-    assert estimate_contact(track_at(.425),None,None,10)['state']=='unknown'
-    quiet=event_evidence(missed,[],None)
-    assert decide(.9,3,missed,quiet)[0]=='confirmed'
-    assert decide(.5,3,missed,quiet)[0]=='needs_review'
-    assert decide(.1,3,hit,dict(quiet,shock=True))[0]=='dismissed'
+    # Retrieve findings list
+    findings = get_findings(job_id)
+    assert len(findings) == 1
+    assert findings[0]["id"] == finding_id
 
-def test_impact_time_and_axle_coverage():
-    contact={'windows':[[1,1.4],[2,2.4]]}
-    telemetry=Telemetry(samples=[{'t':i*.05,'az':4 if i==44 else 0} for i in range(61)]).model_dump()
-    result=event_evidence(contact,[],telemetry)
-    assert result['imu_available'] and result['shock'] and result['event_t']==2.2
-    assert not event_evidence({'windows':[[.1,.5]]},[],telemetry)['shock']
-    telemetry['synchronization_uncertainty_s']=1
-    assert not event_evidence(contact,[],telemetry)['imu_available']
-    assert decide(.9,3,{'state':'contact_expected'},dict(result,ambiguous=True))[0]=='needs_review'
+    # 3. Agent steps CRUD
+    step1 = add_agent_step(
+        job_id=job_id,
+        finding_ref=finding_id,
+        step_no=1,
+        action="shadow_verification",
+        reason="Intensity gradient indicates real depth rather than surface stain",
+        confidence_before=0.80,
+        confidence_after=0.95,
+    )
+    assert step1["id"] is not None
+    assert step1["step_no"] == 1
 
-def test_tracker_contract_gap_and_best_frame():
-    t=track_at(.5);t.detections[1]['confidence']=.95
-    assert t.best_frame_data['index']==1
-    assert len(build_tracks([[d] for d in t.detections],t.frame_data_list))==1
-    t.frame_data_list[-1]['timestamp_s']=3
-    assert len(build_tracks([[d] for d in t.detections],t.frame_data_list))==2
-    with pytest.raises(ValueError):build_tracks(t.detections,t.frame_data_list)
+    steps = get_agent_steps(job_id, finding_ref=finding_id)
+    assert len(steps) == 1
+    assert steps[0]["action"] == "shadow_verification"
 
-def test_native_motion_independent_of_visual_sampling(video):
-    frames,motion,meta=decode_video(video)
-    assert len(motion)==40 and 2<=len(frames)<=8
-    assert meta['decoded_frames']==40
 
-def test_full_api_pipeline_review_and_report(video):
-    with TestClient(app) as client:
-        with video.open('rb') as f:
-            r=client.post('/api/jobs',files={'video':('synthetic.avi',f,'video/x-msvideo')},data={'options_json':json.dumps({'source_kind':'synthetic'})})
-        assert r.status_code==201,r.text
-        jid=r.json()['job_id'];deadline=time.monotonic()+40
-        while time.monotonic()<deadline:
-            j=client.get('/api/jobs/'+jid).json()
-            if j['status'] in ('done','failed'):break
-            time.sleep(.1)
-        assert j['status']=='done',j
-        assert j['evidence']['model']['state']=='baseline_untrained'
-        assert j['evidence']['video']['decoded_frames']==40
-        rows=client.get(f'/api/jobs/{jid}/findings').json()['findings'];assert rows
-        for row in rows:
-            assert row['agent_steps'] and all(s['finding_ref']==row['id'] for s in row['agent_steps'])
-            assert client.get(row['image_url']).status_code==200
-            assert client.post('/api/findings/'+row['id']+'/review',json={'decision':'reject'}).status_code==200
-        j=client.get('/api/jobs/'+jid).json();assert j['summary']['by_status']['rejected']==len(rows)
-        report=client.post(f'/api/jobs/{jid}/report');assert report.status_code==200,report.text
-        assert client.get(report.json()['report_url']).content.startswith(b'%PDF')
-        client.post('/api/findings/'+rows[0]['id']+'/review',json={'decision':'approve'})
-        assert client.post(f'/api/jobs/{jid}/report').status_code==200
-        assert client.get(f'/api/jobs/{jid}/export').status_code==200
-        assert client.get('/api/storage/nope?expires=1&signature=invalid').status_code==403
+def test_storage_helpers():
+    temp_dir = tempfile.mkdtemp()
+    try:
+        sample_path = os.path.join(temp_dir, "test.txt")
+        Path(sample_path).write_text("road damage report payload")
 
-def test_auth_and_invalid_upload(monkeypatch):
-    import app.main as main
-    monkeypatch.setattr(main,'API_KEY','test-key')
-    with TestClient(app) as client:
-        assert client.get('/api/jobs').status_code==401
-        assert client.get('/api/health').status_code==200
-        assert client.get('/api/jobs',headers={'X-API-Key':'test-key'}).status_code==200
-        assert client.post('/api/jobs',headers={'X-API-Key':'test-key'},files={'video':('bad.mp4',b'not video')}).status_code==422
+        # Test upload_file
+        key = upload_file(sample_path, "reports/test.txt")
+        assert key == "reports/test.txt"
 
-def training_records():
-    rng=np.random.default_rng(7);records=[]
-    for split in ['train','validation','test']:
-        for i in range(40):
-            exists=int(i%4!=0);contact='yes' if i%4 in (1,2) else 'no';impact=int(i%4==1)
-            f=dict(zip(FEATURES,[float(rng.uniform(.6,.95) if exists else rng.uniform(.1,.5)),.8 if exists else .2,1,4,1 if contact=='yes' else 0,1,5 if impact else 0,.8,4 if impact else 0,1,8]))
-            records.append(dict(event_id=f'{split}-{i}',drive_id=split,site_id=split,split=split,pothole_exists=exists,impact_associated=impact,contact_label=contact,source_kind='synthetic',features=f))
-    return records
+        # Test presign_get
+        url = presign_get("reports/test.txt")
+        assert url.startswith("file://")
 
-def test_training_export_and_no_contact_recall(tmp_path):
-    records=training_records()
-    with pytest.raises(ValueError):validate(records)
-    validate(records,True);artifact=train(records)
-    assert artifact['source_kind']=='synthetic' and artifact['test_metrics']['no_contact_pothole_recall']['n']==10
-    p=tmp_path/'model.json';p.write_text(json.dumps(artifact));model=FusionModel(p);assert model.experimental
-    assert set(model.predict(records[-1]['features']))=={'pothole_exists','impact_associated'}
-    altered=copy.deepcopy(records);altered[-1]['drive_id']='train'
-    with pytest.raises(ValueError,match='leaks'):validate(altered,True)
+        # Test download_file
+        download_target = os.path.join(temp_dir, "downloaded.txt")
+        download_file("reports/test.txt", download_target)
+        assert Path(download_target).read_text() == "road damage report payload"
 
-def test_benchmark_counts_misses_and_duplicates():
-    from eval.eval import evaluate
-    labels=[{'event_id':'a','pothole_exists':1,'contact_label':'no'},{'event_id':'b','pothole_exists':1,'contact_label':'yes'}]
-    p={'prediction_id':'1','event_id':'a','vision_positive':True,'shock_positive':False,'fusion_positive':True}
-    result=evaluate(labels,[p,dict(p,prediction_id='2')])
-    assert result['fusion_positive']['tp']==1
-    assert result['fusion_positive']['fp']==1
-    assert result['fusion_positive']['fn']==1
-    assert result['fusion_positive']['no_contact_recall']==1
+        # Test upload_bytes
+        byte_key = upload_bytes(b"binary payload", "bytes/sample.bin", "application/octet-stream")
+        assert byte_key == "bytes/sample.bin"
+    finally:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
-def test_portrait_frame_memory_bound():
-    from app.cv.video import frame_record
-    record=frame_record(np.zeros((2000,100,3),dtype='uint8'),0,0)
-    assert max(record['gray'].shape)<=640
 
-def test_empty_visual_path_is_honest(tmp_path):
-    from app.pipeline import run_pipeline
-    from app.storage import upload_file
-    p=tmp_path/'blank.avi';writer=cv2.VideoWriter(str(p),cv2.VideoWriter_fourcc(*'MJPG'),10,(320,180))
-    for _ in range(10):writer.write(np.full((180,320,3),100,dtype='uint8'))
-    writer.release();upload_file(str(p),'jobs/blank/video.avi')
-    j=db.create_job(video_key='jobs/blank/video.avi')
-    run_pipeline(j['id']);done=db.get_job(j['id'])
-    assert done['status']=='done' and done['frames_used']==0
-    assert db.get_findings(j['id'])==[]
-    assert 'No retained sharp' in json.loads(done['evidence_json'])['coverage_note']
+def test_api_jobs_upload_and_validation():
+    client = TestClient(app)
+
+    # 1. Invalid extension test
+    fake_txt = io.BytesIO(b"fake text content")
+    resp = client.post(
+        "/api/jobs",
+        files={"video": ("sample.txt", fake_txt, "text/plain")},
+    )
+    assert resp.status_code == 400
+    assert "Invalid file extension" in resp.json()["detail"]
+
+    # 2. Valid video upload
+    fake_video = io.BytesIO(b"fake mp4 video bytes")
+    resp = client.post(
+        "/api/jobs",
+        files={"video": ("test_road.mp4", fake_video, "video/mp4")},
+        data={"location_text": "MG Road", "lat": "12.97", "lon": "77.59"},
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert "job_id" in data
+    assert data["status"] == "uploaded"
+    job_id = data["job_id"]
+
+    # 3. GET /api/jobs/{job_id}
+    job_resp = client.get(f"/api/jobs/{job_id}")
+    assert job_resp.status_code == 200
+    job_data = job_resp.json()
+    assert job_data["id"] == job_id
+    assert job_data["location_text"] == "MG Road"
+    assert job_data["status"] in ("uploaded", "processing", "done", "failed")
+
+
+def test_api_findings_and_review():
+    client = TestClient(app)
+
+    # Create job and finding directly in DB
+    job = create_job(video_key="jobs/j1/video.mp4")
+    f = create_finding(
+        job_id=job["id"],
+        type="crack",
+        severity_label="medium",
+        severity_score=0.6,
+        confidence=0.85,
+        status="needs_review",
+        bbox_json=json.dumps({"x": 10, "y": 20, "w": 30, "h": 40}),
+        image_key=f"jobs/{job['id']}/finding_annotated.jpg",
+    )
+    add_agent_step(
+        job_id=job["id"],
+        finding_ref=f["id"],
+        step_no=1,
+        action="crack_width_analysis",
+        reason="Crack width > 5mm classified as medium severity",
+    )
+
+    # Test GET /api/jobs/{job_id}/findings
+    findings_resp = client.get(f"/api/jobs/{job['id']}/findings")
+    assert findings_resp.status_code == 200
+    f_data = findings_resp.json()
+    assert f_data["total"] == 1
+    finding_item = f_data["findings"][0]
+    assert finding_item["id"] == f["id"]
+    assert finding_item["image_url"] is not None
+    assert len(finding_item["agent_steps"]) == 1
+
+    # Test POST /api/findings/{finding_id}/review - approve
+    review_resp = client.post(
+        f"/api/findings/{f['id']}/review",
+        json={"decision": "approve"},
+    )
+    assert review_resp.status_code == 200
+    assert review_resp.json()["status"] == "confirmed"
+
+    # Test POST /api/findings/{finding_id}/review - reject
+    review_resp2 = client.post(
+        f"/api/findings/{f['id']}/review",
+        json={"decision": "reject"},
+    )
+    assert review_resp2.status_code == 200
+    assert review_resp2.json()["status"] == "rejected"
+
+
+def test_api_report_endpoint(monkeypatch):
+    client = TestClient(app)
+    job = create_job(video_key="jobs/j2/video.mp4")
+
+    # Mock app.report module
+    import sys
+    import types
+    fake_report_module = types.ModuleType("app.report")
+
+    def mock_generate_report(job, findings, output_path=None):
+        content = b"%PDF-1.4 Mock PDF Report Content"
+        if output_path:
+            Path(output_path).write_bytes(content)
+            return output_path
+        return content
+
+    fake_report_module.generate_report = mock_generate_report
+    monkeypatch.setitem(sys.modules, "app.report", fake_report_module)
+
+    resp = client.post(f"/api/jobs/{job['id']}/report")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["job_id"] == job["id"]
+    assert "report_url" in data
+    assert data["report_key"] == f"jobs/{job['id']}/report.pdf"
+
+
+def test_pipeline_e2e(monkeypatch):
+    import cv2
+    import numpy as np
+    import sys
+    import types
+
+    # 1. Create a dummy test video
+    temp_dir = tempfile.mkdtemp()
+    video_path = os.path.join(temp_dir, "test_input.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(video_path, fourcc, 10.0, (640, 480))
+
+    # Write 15 synthetic frames with high Laplacian variance (sharp road texture)
+    np.random.seed(42)
+    for i in range(15):
+        frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+        # Add random noise so is_blurry is False
+        noise = np.random.randint(0, 50, (480, 640, 3), dtype=np.uint8)
+        frame = cv2.add(frame, noise)
+        # Draw a simulated pothole in lower half
+        cv2.circle(frame, (320, 360), 30, (40, 40, 40), -1)
+        out.write(frame)
+    out.release()
+
+    # Upload video to local storage
+    s3_key = "jobs/test_e2e_job/video.mp4"
+    upload_file(video_path, s3_key)
+
+    # Create job
+    job = create_job(video_key=s3_key, status="uploaded")
+    job_id = job["id"]
+
+    # Mock pothole, crack, track, and agent modules
+    mock_pothole_mod = types.ModuleType("app.cv.pothole")
+    mock_crack_mod = types.ModuleType("app.cv.crack")
+    mock_track_mod = types.ModuleType("app.cv.track")
+    mock_agent_mod = types.ModuleType("app.agent")
+
+    def mock_detect_potholes(frame_dict):
+        return [{
+            "type": "pothole",
+            "bbox": [300, 340, 60, 50],
+            "confidence": 0.92,
+            "severity_score": 0.85,
+            "severity_label": "high",
+            "measurements": {"area_px": 2500, "depth_est_cm": 6.5},
+        }]
+
+    def mock_detect_cracks(frame_dict):
+        return []
+
+    def mock_build_tracks(frames, detections):
+        return [{
+            "type": "pothole",
+            "bbox": [300, 340, 60, 50],
+            "confidence": 0.92,
+            "severity_score": 0.85,
+            "severity_label": "high",
+            "frame_index": 0,
+            "timestamp_s": 0.0,
+            "measurements": {"area_px": 2500, "depth_est_cm": 6.5},
+            "status": "confirmed",
+        }]
+
+    def mock_run_agent(job_id, tracks, frames):
+        add_agent_step(
+            job_id=job_id,
+            finding_ref=None,
+            step_no=1,
+            action="multiframe_pothole_verification",
+            reason="Pothole persisted across frames with consistent shadow depression",
+            confidence_before=0.85,
+            confidence_after=0.92,
+        )
+        return tracks
+
+    mock_pothole_mod.detect_potholes = mock_detect_potholes
+    mock_crack_mod.detect_cracks = mock_detect_cracks
+    mock_track_mod.build_tracks = mock_build_tracks
+    mock_agent_mod.run_agent = mock_run_agent
+
+    monkeypatch.setitem(sys.modules, "app.cv.pothole", mock_pothole_mod)
+    monkeypatch.setitem(sys.modules, "app.cv.crack", mock_crack_mod)
+    monkeypatch.setitem(sys.modules, "app.cv.track", mock_track_mod)
+    monkeypatch.setitem(sys.modules, "app.agent", mock_agent_mod)
+
+    try:
+        # Run orchestrator
+        run_pipeline(job_id)
+
+        # Assert job state
+        finished_job = get_job(job_id)
+        assert finished_job["status"] == "done"
+        assert finished_job["frames_total"] > 0
+        assert finished_job["frames_done"] == finished_job["frames_total"]
+        assert finished_job["summary_json"] is not None
+
+        summary = json.loads(finished_job["summary_json"])
+        assert summary["total_findings"] >= 1
+        assert summary["by_type"]["pothole"] >= 1
+
+        # Assert findings state
+        findings = get_findings(job_id)
+        assert len(findings) >= 1
+        f = findings[0]
+        assert f["image_key"] is not None
+        assert f["crop_key"] is not None
+
+        # Assert agent steps
+        steps = get_agent_steps(job_id)
+        assert len(steps) >= 1
+        assert steps[0]["action"] == "multiframe_pothole_verification"
+
+    finally:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+

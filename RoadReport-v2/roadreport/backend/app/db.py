@@ -104,16 +104,6 @@ def init_db() -> None:
             );
         """)
 
-        for name in ("options_json", "evidence_json"):
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-            if name not in columns:
-                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
-        conn.execute("""CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            finding_id TEXT NOT NULL REFERENCES findings(id),
-            decision TEXT NOT NULL, reviewer TEXT NOT NULL,
-            created_at TEXT NOT NULL)""")
-
         # Indexes for query performance
         conn.execute("CREATE INDEX IF NOT EXISTS idx_findings_job_id ON findings(job_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_steps_job_id ON agent_steps(job_id);")
@@ -175,8 +165,6 @@ def create_job(
 def update_job(job_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
     """Update fields of an existing job record."""
     allowed_columns = {
-        "options_json",
-        "evidence_json",
         "status",
         "video_key",
         "location_text",
@@ -378,28 +366,5 @@ def get_agent_steps(job_id: str, finding_ref: Optional[str] = None) -> List[Dict
         return [dict(row) for row in rows]
 
 
-def refresh_summary(job_id):
-    findings = get_findings(job_id)
-    summary = {"total_findings": len(findings), "by_status": {}, "by_type": {}}
-    for f in findings:
-        for key, field in (("by_status", "status"), ("by_type", "type")):
-            summary[key][f[field]] = summary[key].get(f[field], 0) + 1
-    update_job(job_id, summary_json=__import__("json").dumps(summary))
-    return summary
-
-
-def review_finding(finding_id, decision, reviewer="team reviewer"):
-    with get_db() as conn:
-        conn.execute("UPDATE findings SET status=? WHERE id=?",
-                     ("approved" if decision == "approve" else "rejected", finding_id))
-        conn.execute("INSERT INTO reviews (finding_id,decision,reviewer,created_at) VALUES (?,?,?,?)",
-                     (finding_id, decision, reviewer, datetime.now(timezone.utc).isoformat()))
-    finding = get_finding(finding_id)
-    refresh_summary(finding["job_id"])
-    return finding
-
-
-def list_jobs():
-    with get_db() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50")]
-
+# Initialize the database upon module import
+init_db()

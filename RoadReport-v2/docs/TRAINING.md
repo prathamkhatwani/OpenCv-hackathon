@@ -1,5 +1,7 @@
 # Training a contact-aware event classifier
 
+The real RDD2022 visual crop model has a separate [dataset guide](RDD2022.md). This document describes the still-untrained paired event/shock model. RDD2022 cannot supply its missing sensor labels.
+
 ## Status and experimental design
 
 The delivered code is trainable; it is not a field-validated trained model. Two heads predict `pothole_exists` and `impact_associated`. Existence uses initial visual score, reinspection score, track duration and observation count only. Association additionally uses contact overlap/availability, camera pulse/quality, IMU peak/availability and speed. When no reinspection is requested, its feature equals the initial visual score; the UI explicitly says Not requested. This explicitly prevents missing shock from becoming an existence feature. It cannot recover potholes that the classical candidate detector never proposes.

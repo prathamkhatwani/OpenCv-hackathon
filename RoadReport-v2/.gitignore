@@ -1,0 +1,20 @@
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.venv/
+.train_venv/
+.env
+*.db
+storage/
+runs/
+
+# Dataset downloads & caches
+data/
+*.partial
+*.cache
+*.zip
+*.pt
+
+# macOS
+.DS_Store

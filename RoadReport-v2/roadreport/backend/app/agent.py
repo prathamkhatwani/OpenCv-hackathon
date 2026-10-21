@@ -172,52 +172,176 @@ def run_detector_strict(crop: np.ndarray, det_type: str) -> float:
     return 0.0
 
 
+def run_agent(
+    tracks: list,
+    add_step_fn: Callable,
+    create_finding_fn: Callable,
+    job_id: str,
+    frame_data_list: list
+) -> List[Dict[str, Any]]:
+    """
+    Run the agent decision loop on all tracks.
 
-def inspect_track(track,video_path):
-    """Bounded adaptive action: inspect three native-resolution neighboring frames."""
-    from app.cv.video import neighboring_frames
-    best=track.best_detection;f=track.best_frame_data
-    h,w=f['gray'].shape;x,y,bw,bh=best['bbox']
-    scores=[];observations=[]
-    for frame,t in neighboring_frames(video_path,f['timestamp_s']):
-        hh,ww=frame.shape[:2]
-        box=[x*ww/w,y*hh/h,bw*ww/w,bh*hh/h]
-        crop=pad_crop(frame,box)
-        if crop.size:
-            score=run_detector_strict(crop,track.type)
-            scores.append(score);observations.append({'t':round(t,4),'score':round(score,4),'native_size':[ww,hh]})
-    return float(np.median(scores)) if scores else track.best_confidence,observations
+    Args:
+        tracks: List of Track objects (or dicts) from build_tracks.
+        add_step_fn: Function to log agent steps (job_id, finding_ref, step_no,
+                     action, reason, conf_before, conf_after).
+        create_finding_fn: Function to persist a finding in the database.
+        job_id: Current job ID string.
+        frame_data_list: List of all extracted frame data for potential re-extraction.
 
+    Returns:
+        List of finding dictionaries with status decisions and metadata.
+    """
+    findings: List[Dict[str, Any]] = []
 
-def run_agent(tracks,video_path,motion,options,meta,model=None):
-    from app.cv.contact import estimate_contact
-    from app.cv.motion import event_evidence
-    from app.ml.features import extract
-    from app.ml.decision import decide
-    candidates=[]
-    for track in tracks[:100]:
-        contact=estimate_contact(track,options.get('calibration'),options.get('telemetry'),meta['duration_s']) if track.type=='pothole' else {'state':'unknown','overlap':None,'windows':[],'corridors':[],'reason':'Tyre-contact fusion applies to potholes'}
-        impact=event_evidence(contact,motion,options.get('telemetry'))
-        candidates.append((track,contact,impact))
-    for i,(_,contact,impact) in enumerate(candidates):
-        if impact['shock'] and impact['event_t'] is not None:
-            impact['ambiguous']=any(j!=i and other['state']=='contact_expected' and any(a<=impact['event_t']<=b for a,b in other['windows']) for j,(_,other,_) in enumerate(candidates))
-    results=[]
-    for track,contact,impact in candidates:
-        initial=track.best_confidence;reinspect=initial;reinspection_performed=False
-        trace=[{'action':'detect_and_track','reason':f'{track.n} observed frames; classical visual score {initial:.3f}','before':None,'after':initial}]
-        trace.append({'action':'estimate_contact','reason':contact['reason'],'before':initial,'after':initial})
-        trace.append({'action':'check_motion','reason':f"Source: {impact['source']}; pulse: {impact['shock']}; ambiguous: {impact.get('ambiguous',False)}",'before':initial,'after':initial})
-        if .3<=initial<.75 or impact.get('ambiguous'):
-            reinspection_performed=True
-            reinspect,samples=inspect_track(track,video_path)
-            visual=.6*initial+.4*reinspect
-            trace.append({'action':'inspect_neighboring_frames','reason':'Native-frame inspection: '+json.dumps(samples),'before':initial,'after':visual})
-        else:visual=initial
-        features=extract(track,reinspect,contact,impact)
-        predictions=model.predict(features) if model and track.type=='pothole' else None
-        status,evidence_class,reason=decide(visual,track.n,contact,impact,predictions,model.experimental if model else False)
-        if track.type=='crack':evidence_class='visual_only' if status=='confirmed' else 'uncertain'
-        trace.append({'action':('request_human_review' if status=='needs_review' else status),'reason':reason,'before':visual,'after':visual})
-        results.append({'track':track,'status':status,'evidence_class':evidence_class,'reason':reason,'visual_score':visual,'initial_score':initial,'reinspection_score':reinspect,'reinspection_performed':reinspection_performed,'contact':contact,'impact':impact,'predictions':predictions,'features':features,'trace':trace})
-    return results
+    for track_idx, track in enumerate(tracks):
+        c = float(track['best_confidence'] if isinstance(track, dict) else track.best_confidence)
+        n = int(track['n'] if isinstance(track, dict) else track.n)
+        track_type = str(track['type'] if isinstance(track, dict) else track.type)
+        best_det = track['best_detection'] if isinstance(track, dict) else track.best_detection
+        best_fdata = track['best_frame_data'] if isinstance(track, dict) else track.best_frame_data
+        detections = track['detections'] if isinstance(track, dict) else track.detections
+        track_fdata_list = track['frame_data_list'] if isinstance(track, dict) else track.frame_data_list
+
+        finding_ref = f"track_{track_idx}"
+        step_no = 0
+
+        # Step 1: Initial detection log
+        step_no += 1
+        add_step_fn(
+            job_id=job_id,
+            finding_ref=finding_ref,
+            step_no=step_no,
+            action="detected",
+            reason=f"Pass-1 confidence {c:.2f}, seen in {n} frames",
+            confidence_before=0.0,
+            confidence_after=c
+        )
+
+        if c >= HIGH and n >= 2:
+            # High confidence + persistent → confirmed
+            status = "confirmed"
+            reason = f"High confidence ({c:.2f}) and persistent ({n} frames)"
+            step_no += 1
+            add_step_fn(job_id, finding_ref, step_no, "confirmed", reason, c, c)
+
+        elif c >= MID:
+            # Medium confidence → re-inspect with 3x zoom
+            crop = pad_crop(best_fdata['frame'], best_det['bbox'], pad=0.25)
+            if crop.size > 0:
+                crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+                crop = unsharp_mask(crop)
+                c2 = run_detector_strict(crop, track_type)
+            else:
+                c2 = 0.0
+
+            step_no += 1
+            add_step_fn(
+                job_id, finding_ref, step_no, "re-inspect",
+                f"3x zoom re-inspection: confidence {c:.2f} → {c2:.2f}",
+                c, c2
+            )
+
+            if c2 >= 0.70 and n >= 3:
+                status = "confirmed"
+                reason = f"Confirmed after re-inspection (c2={c2:.2f}, {n} frames)"
+            elif c2 < LOW and n < 3:
+                status = "dismissed"
+                reason = f"Likely shadow or stain (c2={c2:.2f}, {n} frames)"
+            else:
+                status = "needs_review"
+                reason = f"Evidence still mixed (c2={c2:.2f}, {n} frames)"
+
+            step_no += 1
+            add_step_fn(job_id, finding_ref, step_no, status, reason, c, c2)
+            c = max(c, c2)  # Use best confidence
+
+        else:
+            # Low confidence → dismissed
+            status = "dismissed"
+            reason = f"Below minimum confidence ({c:.2f})"
+            step_no += 1
+            add_step_fn(job_id, finding_ref, step_no, "dismissed", reason, c, c)
+
+        # Check for blurry best frame - try neighboring frames in track
+        if status != "dismissed":
+            try:
+                from .cv.frames import is_blurry
+            except (ImportError, AttributeError):
+                def is_blurry(gray_img: np.ndarray, threshold: float = 80.0) -> bool:
+                    return float(cv2.Laplacian(gray_img, cv2.CV_64F).var()) < threshold
+
+            best_gray = best_fdata['gray']
+            if is_blurry(best_gray, threshold=80.0):
+                step_no += 1
+                sharpest_idx = 0
+                sharpest_var = float(cv2.Laplacian(best_gray, cv2.CV_64F).var())
+                for i, (det_item, fdata_item) in enumerate(zip(detections, track_fdata_list)):
+                    var = float(cv2.Laplacian(fdata_item['gray'], cv2.CV_64F).var())
+                    if var > sharpest_var:
+                        sharpest_var = var
+                        sharpest_idx = i
+
+                try:
+                    current_idx = detections.index(best_det)
+                except ValueError:
+                    current_idx = -1
+
+                if sharpest_idx != current_idx and sharpest_idx < len(detections):
+                    add_step_fn(
+                        job_id, finding_ref, step_no, "re-extract",
+                        f"Best frame blurry (var={cv2.Laplacian(best_gray, cv2.CV_64F).var():.0f}), "
+                        f"using sharper frame (var={sharpest_var:.0f})",
+                        c, c
+                    )
+                    best_det = detections[sharpest_idx]
+                    best_fdata = track_fdata_list[sharpest_idx]
+
+        # Create finding if not dismissed
+        if status != "dismissed":
+            try:
+                from .cv.severity import compute_severity
+            except (ImportError, AttributeError):
+                def compute_severity(detection: dict) -> Tuple[float, str]:
+                    meas = detection.get('measurements', {})
+                    area = float(meas.get('area_px', 500))
+                    score = min(100.0, max(10.0, area / 20.0))
+                    label = "High" if score >= 70.0 else ("Medium" if score >= 40.0 else "Low")
+                    return score, label
+
+            severity_score, severity_label = compute_severity(best_det)
+
+            finding: Dict[str, Any] = {
+                'job_id': job_id,
+                'type': track_type,
+                'severity_label': severity_label,
+                'severity_score': severity_score,
+                'confidence': round(c, 3),
+                'status': status,
+                'frame_index': best_fdata['index'],
+                'timestamp_s': best_fdata['timestamp_s'],
+                'bbox_json': json.dumps(list(best_det['bbox'])),
+                'measurements_json': json.dumps(best_det.get('measurements', {})),
+                'finding_ref': finding_ref,
+                'frame': best_fdata['frame'],  # For image saving later
+                'bbox': best_det['bbox'],
+            }
+
+            finding_id = create_finding_fn(finding)
+            finding['id'] = finding_id
+            findings.append(finding)
+
+            logger.info(
+                f"Finding {finding_ref}: {track_type} - {status} "
+                f"(confidence={c:.2f}, severity={severity_label})"
+            )
+
+    confirmed = sum(1 for f in findings if f['status'] == 'confirmed')
+    review = sum(1 for f in findings if f['status'] == 'needs_review')
+    logger.info(
+        f"Agent complete: {confirmed} confirmed, {review} needs_review, "
+        f"{len(tracks) - len(findings)} dismissed"
+    )
+
+    return findings

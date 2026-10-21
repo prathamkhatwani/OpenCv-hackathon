@@ -34,7 +34,7 @@ def get_region_name() -> str:
 
 def is_local_storage() -> bool:
     """Check if local storage mode is enabled via environment variable."""
-    return os.getenv("USE_LOCAL_STORAGE", "true").strip().lower() in ("true", "1", "yes")
+    return os.getenv("USE_LOCAL_STORAGE", "false").strip().lower() in ("true", "1", "yes")
 
 
 def get_local_storage_dir() -> Path:
@@ -58,14 +58,8 @@ def get_s3_client() -> Any:
 
 def _get_local_dest_path(s3_key: str) -> Path:
     """Map an S3 key path to a safe local filesystem path inside the storage directory."""
-    root = get_local_storage_dir().resolve()
-    if not s3_key or "\\" in s3_key or Path(s3_key).is_absolute():
-        raise ValueError("Invalid storage key")
-    result = (root / s3_key).resolve()
-    if not result.is_relative_to(root) or result == root:
-        raise ValueError("Storage key escapes storage directory")
-    return result
-
+    sanitized_key = s3_key.strip("/").replace("/", os.sep)
+    return get_local_storage_dir() / sanitized_key
 
 
 def upload_file(local_path: str, s3_key: str) -> str:

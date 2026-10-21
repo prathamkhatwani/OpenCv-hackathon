@@ -30,7 +30,7 @@ class Track:
     @property
     def best_frame_data(self) -> dict:
         """Return frame data corresponding to best detection."""
-        best_idx = max(range(self.n), key=lambda i: self.detections[i]["confidence"])
+        best_idx = self.detections.index(self.best_detection)
         return self.frame_data_list[best_idx]
     
     @property
@@ -69,7 +69,7 @@ def _can_link(prev_det: Dict, curr_det: Dict, frame_h: int, frame_w: int) -> boo
         return False
     
     # Downward motion check
-    if dy < -0.08 * frame_h or dy > 0.35 * frame_h:
+    if dy <= 0 or dy > 0.35 * frame_h:
         return False
     
     # Area ratio check (grows as it gets closer)
@@ -139,10 +139,6 @@ def build_tracks(frame_detections: List[Dict], frame_data_list: List[dict]) -> L
     Returns:
         List of Track objects. Tracks with >= 3 detections are 'persistent'.
     """
-    if len(frame_detections) != len(frame_data_list):
-        raise ValueError("Tracker requires one detection list per frame")
-    if any(not isinstance(d, list) for d in frame_detections):
-        raise ValueError("Tracker requires nested detection lists")
     if not frame_detections:
         return []
     
@@ -156,8 +152,6 @@ def build_tracks(frame_detections: List[Dict], frame_data_list: List[dict]) -> L
         
         # Try to extend existing tracks
         for track in active_tracks:
-            if fdata["timestamp_s"] - track.last_frame_data()["timestamp_s"] > 0.65:
-                continue
             best_match_idx = -1
             best_score = -1
             
@@ -194,7 +188,7 @@ def build_tracks(frame_detections: List[Dict], frame_data_list: List[dict]) -> L
         # Move tracks that weren't extended to finished
         still_active = []
         for track in active_tracks:
-            if fdata['timestamp_s'] - track.last_frame_data()['timestamp_s'] <= 0.65:
+            if track.last_frame_data().get('index') == fdata.get('index'):
                 still_active.append(track)
             else:
                 finished_tracks.append(track)

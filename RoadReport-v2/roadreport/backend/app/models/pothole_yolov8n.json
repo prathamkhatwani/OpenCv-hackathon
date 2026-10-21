@@ -1,0 +1,19 @@
+{
+  "model": "yolov8n",
+  "dataset": "RDD2022",
+  "classes": {
+    "0": "longitudinal_crack",
+    "1": "transverse_crack",
+    "2": "alligator_crack",
+    "3": "pothole"
+  },
+  "imgsz": 640,
+  "source": "dronefreak/rdd2022-yolov8n (DetectionBench benchmark)",
+  "benchmark_metrics": {
+    "mAP50": 0.588,
+    "mAP50-95": 0.3205,
+    "precision": 0.6203,
+    "recall": 0.5608
+  },
+  "onnx_path": "app/models/pothole_yolov8n.onnx"
+}

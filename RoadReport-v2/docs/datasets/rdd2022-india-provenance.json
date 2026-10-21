@@ -1,0 +1,10 @@
+{
+  "dataset": "RDD2022 India",
+  "source_url": "https://ndownloader.figshare.com/files/38030910",
+  "figshare_article": "https://doi.org/10.6084/m9.figshare.21431547.v1",
+  "outer_member": "RDD2022/India.zip",
+  "bytes": 526709145,
+  "sha256": "28eab0aa85638855e1907e63b175be2305a0accd018c54603037d3fb8cab963a",
+  "crc32": "f186f6f8",
+  "verification": "Country size/CRC and all inner member CRCs verified; full outer archive MD5 not checked."
+}

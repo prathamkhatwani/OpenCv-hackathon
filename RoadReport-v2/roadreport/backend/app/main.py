@@ -1,177 +1,410 @@
-"""Single-team API. Public deployments require an API key and HTTPS."""
-import hashlib,hmac,json,logging,os,secrets,tempfile,threading,time,uuid
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+"""FastAPI Application for Pothole & Road Damage Reporter."""
+
+import inspect
+import json
+import logging
+import os
 from pathlib import Path
-import cv2
-from fastapi import FastAPI,File,Form,HTTPException,Request,UploadFile
+import shutil
+import tempfile
+from typing import Any, Dict, List, Optional
+import uuid
+
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse,JSONResponse
-from app.db import init_db,get_db,create_job,get_job,update_job,get_findings,get_finding,get_agent_steps,review_finding,list_jobs
-from app.storage import upload_file,download_file,presign_get,is_local_storage,_get_local_dest_path
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from app.db import (
+    create_job,
+    get_agent_steps,
+    get_finding,
+    get_findings,
+    get_job,
+    init_db,
+    update_finding,
+)
 from app.pipeline import run_pipeline
-from app.report import generate_report
-from app.schemas import Options,Review
-from app.cv.video import inspect_video
+from app.storage import presign_get, upload_file
+
+# Configure logger
 logging.basicConfig(level=logging.INFO)
-logger=logging.getLogger(__name__)
-API_KEY=os.getenv('ROADREPORT_API_KEY','')
-SIGNING_SECRET=os.getenv('ROADREPORT_SIGNING_SECRET') or secrets.token_hex(32)
-MAX_BYTES=100*1024*1024
-pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='roadreport')
-slots=threading.BoundedSemaphore(2)
+logger = logging.getLogger(__name__)
+
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+
+from contextlib import asynccontextmanager
+
 
 @asynccontextmanager
-async def lifespan(app):
-    if os.getenv('ROADREPORT_ENV')=='production' and (len(API_KEY)<24 or len(os.getenv('ROADREPORT_SIGNING_SECRET',''))<32):
-        raise RuntimeError('Production requires a 24+ character API key and 32+ character signing secret')
-    if cv2.__version__.split('.')[0]!='5':raise RuntimeError('OpenCV 5 runtime required')
+async def lifespan(app_instance: FastAPI):
+    """Ensure database schema is created on application startup."""
+    logger.info("Initializing database schema on startup...")
     init_db()
-    with get_db() as conn:
-        conn.execute("UPDATE jobs SET status='failed',error_message='Processing interrupted by server restart; upload again.' WHERE status IN ('uploaded','processing')")
     yield
 
-app=FastAPI(title='RoadReport evidence API',version='2.0.0',lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=os.getenv('ROADREPORT_ORIGINS','http://localhost:5173,http://127.0.0.1:5173').split(','),allow_methods=['GET','POST'],allow_headers=['Content-Type','X-API-Key'])
 
-@app.middleware('http')
-async def authorize(request:Request,call_next):
-    path=request.url.path
-    if request.method!='OPTIONS' and API_KEY and path.startswith('/api/') and path!='/api/health' and not path.startswith('/api/storage/'):
-        if not hmac.compare_digest(request.headers.get('X-API-Key',''),API_KEY):
-            return JSONResponse({'detail':'API key required'},status_code=401)
-    return await call_next(request)
+app = FastAPI(
+    title="Pothole & Road Damage Reporter API",
+    description="Backend API for automated road damage detection, verification, and reporting.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS middleware for local frontend dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Standardized JSON format for HTTP exceptions."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
 
 @app.exception_handler(Exception)
-async def unexpected(request,exc):
-    logger.exception('request_failed path=%s',request.url.path)
-    return JSONResponse({'detail':'Internal error; consult server logs'},status_code=500)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all exception handler to log and return clean error responses."""
+    logger.exception("Unhandled server error processing request to %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)},
+    )
 
 
-def signed_url(key):
-    if not is_local_storage():return presign_get(key,expires=3600)
-    expires=int(time.time())+3600
-    sig=hmac.new(SIGNING_SECRET.encode(),f'{key}:{expires}'.encode(),hashlib.sha256).hexdigest()
-    return f'/api/storage/{key}?expires={expires}&signature={sig}'
-
-@app.get('/api/health')
-def health():
-    return {'status':'ok','version':'2.0.0','opencv':cv2.__version__,'storage':'local' if is_local_storage() else 's3','authentication_required':bool(API_KEY)}
-
-@app.get('/api/storage/{key:path}')
-def local_file(key:str,expires:int,signature:str):
-    if not is_local_storage():raise HTTPException(404,'Local storage disabled')
-    expected=hmac.new(SIGNING_SECRET.encode(),f'{key}:{expires}'.encode(),hashlib.sha256).hexdigest()
-    if expires<int(time.time()) or not hmac.compare_digest(expected,signature):raise HTTPException(403,'Expired or invalid evidence link')
-    try:path=_get_local_dest_path(key)
-    except ValueError:raise HTTPException(400,'Invalid evidence path')
-    if not path.is_file():raise HTTPException(404,'Evidence not found')
-    return FileResponse(path)
+class ReviewRequest(BaseModel):
+    """Payload schema for human review of road damage findings."""
+    decision: str = Field(..., description="'approve' or 'reject'")
 
 
-def execute(job_id):
-    try:run_pipeline(job_id)
-    finally:slots.release()
+@app.post("/api/jobs", status_code=201)
+async def create_job_endpoint(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    video: UploadFile = File(...),
+    location_text: Optional[str] = Form(None),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+) -> Dict[str, Any]:
+    """Upload a video and launch the road damage detection pipeline.
+    
+    Validates file extension and ensures file does not exceed 100MB limit.
+    """
+    filename = video.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file extension '{ext}'. Supported extensions are: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
 
-@app.post('/api/jobs',status_code=201)
-async def upload(request:Request,video:UploadFile=File(...),location_text:str=Form(''),options_json:str=Form('{}')):
-    if len(location_text)>300:raise HTTPException(422,'Location too long')
-    if len(options_json)>2_000_000:raise HTTPException(413,'Sidecars exceed 2 MB')
-    try:options=Options.model_validate_json(options_json).model_dump()
-    except ValueError as e:raise HTTPException(422,str(e)[:600])
-    extension=Path(video.filename or '').suffix.lower()
-    if extension not in ('.mp4','.mov','.avi','.mkv','.webm'):raise HTTPException(400,'Supported formats: MP4, MOV, AVI, MKV, WebM')
-    if not slots.acquire(blocking=False):raise HTTPException(429,'Processing queue full; retry after current job finishes')
-    submitted=False
+    # Check Content-Length header if present
+    content_length_header = request.headers.get("content-length")
+    if content_length_header:
+        try:
+            if int(content_length_header) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds maximum allowed size of 100MB (Header: {content_length_header} bytes).",
+                )
+        except ValueError:
+            pass
+
+    job_id = uuid.uuid4().hex
+    s3_key = f"jobs/{job_id}/video.mp4"
+
+    temp_dir = tempfile.mkdtemp(prefix=f"roadreport_upload_{job_id}_")
+    temp_video_path = os.path.join(temp_dir, f"video{ext}")
+
     try:
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/('video'+extension);total=0
-            with path.open('wb') as output:
-                while chunk:=await video.read(1024*1024):
-                    total+=len(chunk)
-                    if total>MAX_BYTES:raise HTTPException(413,'Video exceeds 100 MB')
-                    output.write(chunk)
-            try:meta=inspect_video(path)
-            except ValueError as e:raise HTTPException(422,str(e))
-            telemetry=options.get('telemetry')
-            if telemetry:
-                if any(not 0<=s['t']+telemetry['time_offset_s']<=meta['duration_s']+.1 for s in telemetry['samples']):
-                    raise HTTPException(422,'Aligned telemetry timestamps must fall within video duration')
-            jid=uuid.uuid4().hex;key=f'jobs/{jid}/video{extension}'
-            upload_file(str(path),key)
-            create_job(video_key=key,job_id=jid,location_text=location_text or None)
-            update_job(jid,options_json=json.dumps(options,allow_nan=False),frames_total=meta['frame_count'])
-            pool.submit(execute,jid);submitted=True
-            return {'job_id':jid,'status':'uploaded'}
+        total_bytes = 0
+        with open(temp_video_path, "wb") as buffer:
+            while chunk := await video.read(1024 * 1024):  # 1MB chunks
+                total_bytes += len(chunk)
+                if total_bytes > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds maximum allowed size of 100MB (Read {total_bytes} bytes).",
+                    )
+                buffer.write(chunk)
+
+        # Upload video to storage
+        upload_file(temp_video_path, s3_key)
+
+        # Create record in DB
+        create_job(
+            job_id=job_id,
+            video_key=s3_key,
+            location_text=location_text,
+            lat=lat,
+            lon=lon,
+            status="uploaded",
+        )
+
+        # Enqueue pipeline in background
+        background_tasks.add_task(run_pipeline, job_id)
+
+        return {"job_id": job_id, "status": "uploaded"}
+
     finally:
-        if not submitted:slots.release()
-        await video.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def require_job(jid):
-    job=get_job(jid)
-    if not job:raise HTTPException(404,'Job not found')
-    return job
+@app.get("/api/jobs/{job_id}")
+def get_job_endpoint(job_id: str) -> Dict[str, Any]:
+    """Retrieve job status, progress, and damage summary."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-def job_response(job):
-    result={k:v for k,v in job.items() if k not in ('options_json','evidence_json','summary_json')}
-    result['summary']=json.loads(job.get('summary_json') or '{}')
-    result['evidence']=json.loads(job.get('evidence_json') or '{}')
-    result['video_url']=signed_url(job['video_key'])
-    result['source_kind']=json.loads(job.get('options_json') or '{}').get('source_kind','real')
-    return result
+    frames_total = job.get("frames_total") or 0
+    frames_done = job.get("frames_done") or 0
+    progress = round(frames_done / frames_total, 3) if frames_total > 0 else 0.0
 
-@app.get('/api/jobs')
-def jobs():
-    return {'jobs':[{'id':j['id'],'status':j['status'],'location_text':j['location_text'],'created_at':j['created_at']} for j in list_jobs()]}
+    summary = None
+    if job.get("summary_json"):
+        try:
+            summary = json.loads(job["summary_json"])
+        except Exception:
+            summary = job["summary_json"]
 
-@app.get('/api/jobs/{jid}')
-def job(jid:str):return job_response(require_job(jid))
+    video_key = job.get("video_key")
+    v_url = presign_get(video_key) if video_key else None
+    video_url = f"/api/storage/{video_key.strip('/')}" if (v_url and v_url.startswith("file://") and not os.getenv("FORCE_FILE_URI")) else v_url
 
-@app.get('/api/jobs/{jid}/findings')
-def findings(jid:str):
-    require_job(jid);output=[]
-    for finding in get_findings(jid):
-        f=dict(finding);f['measurements']=json.loads(f.pop('measurements_json') or '{}');f['bbox']=json.loads(f.pop('bbox_json') or 'null')
-        f['agent_steps']=get_agent_steps(jid,f['id'])
-        for name,key in [('image_url',f.get('image_key')),('crop_url',f.get('crop_key')),('zoom_url',f['measurements'].get('zoom_key'))]:f[name]=signed_url(key) if key else None
-        with get_db() as conn:f['reviews']=[dict(r) for r in conn.execute('SELECT decision,reviewer,created_at FROM reviews WHERE finding_id=? ORDER BY id',(f['id'],))]
-        output.append(f)
-    return {'findings':output,'total':len(output)}
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "video_key": job["video_key"],
+        "video_url": video_url,
+        "location_text": job["location_text"],
+        "lat": job["lat"],
+        "lon": job["lon"],
+        "created_at": job["created_at"],
+        "frames_total": frames_total,
+        "frames_used": job.get("frames_used"),
+        "frames_done": frames_done,
+        "progress": progress,
+        "summary": summary,
+        "summary_json": job.get("summary_json"),
+        "error_message": job.get("error_message"),
+    }
 
-@app.post('/api/findings/{fid}/review')
-def review(fid:str,payload:Review):
-    f=get_finding(fid)
-    if not f:raise HTTPException(404,'Finding not found')
-    if require_job(f['job_id'])['status']!='done':raise HTTPException(409,'Wait for job completion')
-    updated=review_finding(fid,payload.decision,payload.reviewer)
-    add_review_step=len(get_agent_steps(f['job_id'],fid))+1
-    from app.db import add_agent_step
-    add_agent_step(job_id=f['job_id'],finding_ref=fid,step_no=add_review_step,action='human_'+payload.decision,reason='Reviewed by '+payload.reviewer)
-    return updated
 
-@app.post('/api/jobs/{jid}/report')
-def report(jid:str):
-    j=require_job(jid)
-    if j['status']!='done':raise HTTPException(409,'Wait for completed analysis')
-    ff=get_findings(jid)
-    if any(f['status']=='needs_review' for f in ff):raise HTTPException(409,'Resolve pending reviews before report export')
-    selected=[f for f in ff if f['status'] in ('confirmed','approved')]
-    with tempfile.TemporaryDirectory() as directory:
-        for f in selected:
-            if f.get('image_key'):download_file(f['image_key'],str(Path(directory)/Path(f['image_key']).name))
-        path=str(Path(directory)/'report.pdf');generate_report(j,selected,directory,path)
-        key=f'jobs/{jid}/reports/{uuid.uuid4().hex}.pdf';upload_file(path,key)
-    return {'report_url':signed_url(key)}
+@app.get("/api/jobs/{job_id}/findings")
+def get_job_findings_endpoint(job_id: str) -> Dict[str, Any]:
+    """Retrieve all findings for a job with presigned URLs and agent verification steps."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-@app.get('/api/jobs/{jid}/export')
-def export(jid:str):
-    j=require_job(jid)
-    if j['status']!='done':raise HTTPException(409,'Analysis is not complete')
-    # No signed URLs in archival evidence exports.
-    return {'schema_version':1,'job':j,'findings':get_findings(jid),'trace':get_agent_steps(jid),'note':'Use measurements.features for labeled training events; labels must be annotated independently.'}
+    raw_findings = get_findings(job_id)
+    enriched_findings: List[Dict[str, Any]] = []
 
-# Container serves the built dashboard on the same origin as the API.
-if os.getenv('FRONTEND_DIST'):
-    from fastapi.staticfiles import StaticFiles
-    app.mount('/',StaticFiles(directory=os.environ['FRONTEND_DIST'],html=True),name='dashboard')
+    for f in raw_findings:
+        item = dict(f)
+
+        # Presign image and crop URLs
+        image_key = item.get("image_key")
+        crop_key = item.get("crop_key")
+        img_url = presign_get(image_key) if image_key else None
+        crp_url = presign_get(crop_key) if crop_key else None
+        
+        # If local file URI, convert to accessible /api/storage HTTP path for browsers
+        if img_url and img_url.startswith("file://") and not os.getenv("FORCE_FILE_URI"):
+            item["image_url"] = f"/api/storage/{image_key.strip('/')}"
+        else:
+            item["image_url"] = img_url
+            
+        if crp_url and crp_url.startswith("file://") and not os.getenv("FORCE_FILE_URI"):
+            item["crop_url"] = f"/api/storage/{crop_key.strip('/')}"
+        else:
+            item["crop_url"] = crp_url
+
+        # Parse JSON fields
+        if item.get("bbox_json"):
+            try:
+                item["bbox"] = json.loads(item["bbox_json"])
+            except Exception:
+                item["bbox"] = item["bbox_json"]
+        else:
+            item["bbox"] = None
+
+        if item.get("measurements_json"):
+            try:
+                item["measurements"] = json.loads(item["measurements_json"])
+            except Exception:
+                item["measurements"] = item["measurements_json"]
+        else:
+            item["measurements"] = None
+
+        # Presign zoom crop URL
+        zoom_key = None
+        if isinstance(item.get("measurements"), dict):
+            zoom_key = item["measurements"].get("zoom_key")
+        if not zoom_key:
+            zoom_key = f"jobs/{job_id}/findings/finding_{item['id']}_zoom.jpg"
+
+        zm_url = presign_get(zoom_key) if zoom_key else None
+        if zm_url and zm_url.startswith("file://") and not os.getenv("FORCE_FILE_URI"):
+            item["zoom_url"] = f"/api/storage/{zoom_key.strip('/')}"
+        else:
+            item["zoom_url"] = zm_url
+
+        # Retrieve agent reasoning steps for this finding
+        steps = get_agent_steps(job_id, finding_ref=item["id"])
+        item["agent_steps"] = [dict(s) for s in steps]
+
+        enriched_findings.append(item)
+
+    return {
+        "job_id": job_id,
+        "findings": enriched_findings,
+        "total": len(enriched_findings),
+    }
+
+
+@app.post("/api/findings/{finding_id}/review")
+def review_finding_endpoint(finding_id: str, payload: ReviewRequest) -> Dict[str, Any]:
+    """Approve or reject a finding."""
+    decision = payload.decision.strip().lower()
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
+
+    finding = get_finding(finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail=f"Finding '{finding_id}' not found")
+
+    new_status = "confirmed" if decision == "approve" else "rejected"
+    updated = update_finding(finding_id, status=new_status)
+    return {"id": finding_id, "status": new_status, "finding": updated}
+
+
+def _execute_report_generator(
+    job_id: str,
+    job: Dict[str, Any],
+    findings: List[Dict[str, Any]],
+    output_pdf_path: str,
+) -> str:
+    """Helper to dynamically invoke the generate_report function from report module."""
+    try:
+        from app.report import generate_report
+    except ImportError:
+        try:
+            from report import generate_report
+        except ImportError:
+            raise HTTPException(
+                status_code=501,
+                detail="Report generator module (app.report or report) is not installed.",
+            )
+
+    sig = inspect.signature(generate_report)
+    params = list(sig.parameters.keys())
+
+    kwargs = {}
+    if "job_id" in params:
+        kwargs["job_id"] = job_id
+    elif "job" in params:
+        kwargs["job"] = job
+
+    if "findings" in params:
+        kwargs["findings"] = findings
+
+    target_param = next(
+        (p for p in ("output_path", "pdf_path", "dest_path", "path") if p in params),
+        None,
+    )
+    if target_param:
+        kwargs[target_param] = output_pdf_path
+
+    if len(kwargs) == len(params):
+        result = generate_report(**kwargs)
+    elif len(params) == 1 and params[0] == "job_id":
+        result = generate_report(job_id)
+    elif len(params) == 1 and params[0] == "job":
+        result = generate_report(job)
+    elif len(params) == 2 and "job" in params and "findings" in params:
+        result = generate_report(job, findings)
+    elif len(params) == 2 and "job_id" in params and "findings" in params:
+        result = generate_report(job_id, findings)
+    else:
+        try:
+            result = generate_report(job_id=job_id)
+        except TypeError:
+            try:
+                result = generate_report(job=job, findings=findings)
+            except TypeError:
+                result = generate_report(output_pdf_path)
+
+    if isinstance(result, bytes):
+        with open(output_pdf_path, "wb") as f:
+            f.write(result)
+        return output_pdf_path
+    elif isinstance(result, (str, Path)) and os.path.exists(str(result)):
+        return str(result)
+    elif os.path.exists(output_pdf_path):
+        return output_pdf_path
+    else:
+        raise RuntimeError("Report generator did not generate output file at expected path.")
+
+
+@app.post("/api/jobs/{job_id}/report")
+def generate_job_report_endpoint(job_id: str) -> Dict[str, Any]:
+    """Generate a PDF report for a job, upload to storage, and return presigned URL."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    findings = get_findings(job_id)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+        temp_pdf_path = tmp_pdf.name
+
+    try:
+        final_pdf_path = _execute_report_generator(job_id, job, findings, temp_pdf_path)
+        report_key = f"jobs/{job_id}/report.pdf"
+        upload_file(final_pdf_path, report_key)
+        presigned_url = presign_get(report_key)
+
+        if presigned_url and presigned_url.startswith("file://") and not os.getenv("FORCE_FILE_URI"):
+            presigned_url = f"/api/storage/{report_key.strip('/')}"
+
+        return {
+            "job_id": job_id,
+            "report_key": report_key,
+            "report_url": presigned_url,
+        }
+    finally:
+        if os.path.exists(temp_pdf_path):
+            try:
+                os.remove(temp_pdf_path)
+            except OSError:
+                pass
+
+
+@app.get("/api/storage/{file_path:path}")
+def serve_local_storage_file(file_path: str):
+    """Serve files directly from local storage for browser preview and downloads."""
+    from app.storage import _get_local_dest_path
+    local_path = _get_local_dest_path(file_path)
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="File not found in local storage")
+    return FileResponse(str(local_path))
+

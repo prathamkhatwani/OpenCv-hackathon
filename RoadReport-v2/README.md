@@ -4,6 +4,10 @@ A road-inspection prototype that combines visual candidates, estimated tyre path
 
 Built from `prathamkhatwani/opencv`, main commit `1826b47ce071d0df907de289084818a39e2d5d41`. The original repository is unchanged. This package replaces the broken integration and demonstration-only results with an explicit evidence workflow.
 
+## Try the included demo
+
+Double-click **START-DEMO.bat** on Windows, or run `npm ci` then `npm run demo` in `roadreport/frontend`. It opens the explicit 18-second synthetic simulation at http://127.0.0.1:5173/?demo=1 . No backend is required. See [DEMO.md](DEMO.md) for the three cases, controls and asset provenance.
+
 ## What is implemented
 
 - OpenCV 5 classical pothole/crack detection, temporal tracks, stable finding IDs and per-finding action traces.
@@ -15,7 +19,7 @@ Built from `prathamkhatwani/opencv`, main commit `1826b47ce071d0df907de289084818
 - Synchronized video, observed boxes, calibrated corridors, motion plots, actual GPS, source labels, evidence crops, saved reviews, inspection history, PDF and JSON exports.
 - Browser camera/sensor recorder; strict sidecar validation; protected evidence URLs; bounded queue and upload sizes; restart recovery; local or private S3 storage.
 
-**Model status:** no real paired, independently labeled dataset was provided. No field-trained weights or real-world accuracy claims are bundled. The app starts in `baseline_untrained` mode. Synthetic training tests verify the code path only; experimental models cannot unlock `impact_supported` decisions. This is an event classifier over existing CV features, not a newly trained image detector. See [training guide](docs/TRAINING.md).
+**Model status:** RDD2022 India is integrated, and a real-data-trained HOG/logistic visual crop classifier is bundled. Its probability appears in finding details, traces and reports as a display-only pilot. It does not replace the classical proposal detector. The separate shock/event fusion model remains `baseline_untrained`: RDD2022 has no synchronized IMU, tyre-contact or impact labels. See [dataset integration and reproduction](docs/RDD2022.md) and the [paired-event training guide](docs/TRAINING.md).
 
 **Not implemented:** curved-path reconstruction, dense segmentation/depth, learned visual proposal detector, fleet consensus, verified repair tracking, cost optimization, or validated Graviton/COOL benchmarks. The original audit lists these as possible follow-up work; they are not hidden behind placeholder UI.
 
@@ -74,4 +78,4 @@ Verify that the first-frame time has not shifted relative to telemetry after con
 - [Verification and known limits](docs/VERIFICATION.md)
 - [Original file-by-file audit and proposal](docs/ORIGINAL-AUDIT.md)
 
-Original composite demonstration footage, stock/watermarked scratch images and asset-generation scripts are omitted from this clean release because their provenance was not established. They remain in the original GitHub repository. No private credentials, user footage, database, trained weights or node_modules are included. Dependencies retain their upstream licenses; review dataset/media rights and the project's own licensing before public submission.
+Original composite demonstration footage, stock/watermarked scratch images and asset-generation scripts are omitted from this clean release because their provenance was not established. They remain in the original GitHub repository. No private credentials, user footage, database, raw RDD2022 images or node_modules are included. The portable RDD2022 visual pilot weights and measured crop metrics are included. Dependencies retain their upstream licenses; review dataset/media rights and the project's own licensing before public submission.

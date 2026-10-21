@@ -37,3 +37,9 @@ The detector remains classical CV. Its fixed road ROI, heuristic thresholds, gre
 There is one in-process analysis worker with a bounded queue; no durable retry system or multi-user accounts. Signed evidence links expire after one hour; reopen the job to renew them. External map tiles and optional web fonts require network access; analysis does not. A GPS trace is the vehicle route, not a surveyed pothole coordinate.
 
 The existence head is deliberately visual-only to preserve no-contact positives. The association head can support attribution only with appropriate data, timing, geometry and held-out validation. All synthetic fixture scores are software checks and must not be presented as competition accuracy results.
+
+## RDD2022 integration — 21 October 2026
+
+Downloaded the real 526,709,145-byte India archive, verified country size/CRC and inner member CRCs, and imported 6,650 images. Trained and bundled the visual crop pilot; held-out results and limitations are in RDD2022.md and the model metrics JSON. No paired sensor training was performed.
+
+All **21 backend tests passed**, including actual API processing with the bundled weights, persisted visual probability/action trace, review and PDF generation, importer validation and archive containment. Frontend production build and lint both passed. The Starlette adapter deprecation warning remains. No new browser interaction QA was performed.
