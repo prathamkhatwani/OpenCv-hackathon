@@ -30,10 +30,11 @@ from app.db import (
     get_findings,
     get_job,
     init_db,
+    list_jobs,
     update_finding,
 )
 from app.pipeline import run_pipeline
-from app.storage import presign_get, upload_file
+from app.storage import is_local_storage, presign_get, upload_file
 
 # Configure logger
 logging.basicConfig(level=logging.INFO)
@@ -92,6 +93,28 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 class ReviewRequest(BaseModel):
     """Payload schema for human review of road damage findings."""
     decision: str = Field(..., description="'approve' or 'reject'")
+
+
+@app.get("/health")
+@app.get("/api/health")
+def health_endpoint() -> Dict[str, Any]:
+    """Health check endpoint providing runtime and detector status."""
+    import cv2
+    storage_type = "local" if is_local_storage() else "s3"
+    return {
+        "status": "ok",
+        "opencv": cv2.__version__,
+        "detector": "YOLOv8n ONNX (RDD2022)",
+        "authentication_required": False,
+        "storage": storage_type,
+    }
+
+
+@app.get("/api/jobs")
+def list_jobs_endpoint(limit: int = 50) -> Dict[str, Any]:
+    """List recent road damage inspection jobs."""
+    jobs = list_jobs(limit=limit)
+    return {"jobs": jobs, "total": len(jobs)}
 
 
 @app.post("/api/jobs", status_code=201)

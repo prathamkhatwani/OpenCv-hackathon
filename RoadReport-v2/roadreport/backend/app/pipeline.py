@@ -23,6 +23,18 @@ from app.storage import download_file, upload_file
 logger = logging.getLogger(__name__)
 
 
+def _safe_json_dumps(obj: Any) -> str:
+    def _default(o):
+        if isinstance(o, (np.integer, np.int32, np.int64)):
+            return int(o)
+        if isinstance(o, (np.floating, np.float32, np.float64)):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return str(o)
+    return json.dumps(obj, default=_default)
+
+
 def _resolve_pipeline_components() -> Tuple[Callable, Callable, Callable, Callable, Callable]:
     """Dynamically resolve and import CV and agent modules.
     
@@ -131,23 +143,26 @@ def _invoke_tracker(
     tracker_func: Callable,
     frames: List[Dict[str, Any]],
     detections: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Invoke multi-frame tracking function."""
-    sig = inspect.signature(tracker_func)
-    params = list(sig.parameters.keys())
+) -> List[Any]:
+    """Invoke multi-frame tracking function with proper grouping."""
+    # Build per-frame grouped detections
+    per_frame: List[List[Dict[str, Any]]] = [[] for _ in range(len(frames))]
+    idx_map = {fd.get('index', i): i for i, fd in enumerate(frames)}
+    for det in detections:
+        f_idx = det.get('frame_index')
+        slot = idx_map.get(f_idx, 0 if f_idx is None else min(max(0, f_idx), len(per_frame) - 1))
+        per_frame[slot].append(det)
 
-    if len(params) == 1:
-        raw_tracks = tracker_func(detections)
-    elif "frames" in params and any(p in params for p in ("detections", "all_detections", "dets")):
-        det_name = next(p for p in params if p in ("detections", "all_detections", "dets"))
-        raw_tracks = tracker_func(**{"frames": frames, det_name: detections})
-    elif len(params) >= 2:
+    try:
+        raw_tracks = tracker_func(per_frame, frames)
+    except Exception:
         try:
-            raw_tracks = tracker_func(detections, frames)
-        except TypeError:
-            raw_tracks = tracker_func(frames, detections)
-    else:
-        raw_tracks = tracker_func(detections)
+            raw_tracks = tracker_func(frames, per_frame)
+        except Exception:
+            try:
+                raw_tracks = tracker_func(detections, frames)
+            except Exception:
+                raw_tracks = tracker_func(detections)
 
     if raw_tracks is None:
         return []
@@ -157,35 +172,82 @@ def _invoke_tracker(
 def _invoke_agent(
     agent_func: Callable,
     job_id: str,
-    tracks: List[Dict[str, Any]],
+    tracks: List[Any],
     frames: List[Dict[str, Any]],
 ) -> Any:
-    """Invoke agent verification loop."""
+    """Invoke agent verification loop with compatible database helpers."""
+    from app.db import add_agent_step, create_finding
+
+    def _step_fn(*args, **kwargs):
+        if kwargs:
+            j_id = kwargs.get("job_id", job_id)
+            f_ref = kwargs.get("finding_ref")
+            s_no = kwargs.get("step_no", 1)
+            act = kwargs.get("action", "")
+            rsn = kwargs.get("reason", "")
+            c_bef = kwargs.get("confidence_before", kwargs.get("conf_before"))
+            c_aft = kwargs.get("confidence_after", kwargs.get("conf_after"))
+            return add_agent_step(
+                job_id=j_id,
+                step_no=int(s_no) if str(s_no).isdigit() else 1,
+                action=str(act),
+                reason=str(rsn),
+                finding_ref=str(f_ref) if f_ref else None,
+                confidence_before=float(c_bef) if c_bef is not None else None,
+                confidence_after=float(c_aft) if c_aft is not None else None,
+            )
+        if len(args) >= 5 and isinstance(args[1], str) and (isinstance(args[2], int) or str(args[2]).isdigit()):
+            # Called as (job_id, finding_ref, step_no, action, reason, c_before, c_after)
+            j_id, f_ref, s_no, act, rsn = args[0], args[1], args[2], args[3], args[4]
+            c_bef = args[5] if len(args) > 5 else None
+            c_aft = args[6] if len(args) > 6 else None
+            return add_agent_step(
+                job_id=j_id,
+                step_no=int(s_no),
+                action=str(act),
+                reason=str(rsn),
+                finding_ref=str(f_ref),
+                confidence_before=float(c_bef) if c_bef is not None else None,
+                confidence_after=float(c_aft) if c_aft is not None else None,
+            )
+        return add_agent_step(*args)
+
+    def _create_finding_fn(finding_data):
+        if isinstance(finding_data, dict):
+            finding_data.setdefault("job_id", job_id)
+            res = create_finding(finding_data)
+            return res.get("id") if isinstance(res, dict) else res
+        return create_finding(finding_data)
+
     sig = inspect.signature(agent_func)
     params = list(sig.parameters.keys())
 
     kwargs = {}
-    if "job_id" in params:
-        kwargs["job_id"] = job_id
     if "tracks" in params:
         kwargs["tracks"] = tracks
-    elif "detections" in params:
-        kwargs["detections"] = tracks
-    elif "candidates" in params:
-        kwargs["candidates"] = tracks
+    if "job_id" in params:
+        kwargs["job_id"] = job_id
     if "frames" in params:
         kwargs["frames"] = frames
+    elif "frame_data_list" in params:
+        kwargs["frame_data_list"] = frames
+    if "add_step_fn" in params or any("step" in p for p in params):
+        step_p = next(p for p in params if "step" in p)
+        kwargs[step_p] = _step_fn
+    if "create_finding_fn" in params or any("finding" in p for p in params if p not in kwargs):
+        find_p = next(p for p in params if "finding" in p and p not in kwargs)
+        kwargs[find_p] = _create_finding_fn
 
-    if kwargs and len(kwargs) == len(params):
+    if len(kwargs) == len(params):
         return agent_func(**kwargs)
 
     try:
-        return agent_func(job_id, tracks, frames)
-    except TypeError:
+        return agent_func(tracks, _step_fn, _create_finding_fn, job_id, frames)
+    except Exception:
         try:
+            return agent_func(job_id, tracks, frames)
+        except Exception:
             return agent_func(job_id, tracks)
-        except TypeError:
-            return agent_func(job_id)
 
 
 def _draw_finding_box(
@@ -395,11 +457,30 @@ def run_pipeline(job_id: str) -> None:
         if not existing_findings:
             source_findings = agent_result if (isinstance(agent_result, list) and agent_result) else tracks
             for item in source_findings:
-                if isinstance(item, dict):
+                if hasattr(item, "best_detection"):
+                    b_det = item.best_detection
+                    b_fdata = item.best_frame_data
+                    bbox_val = b_det.get("bbox", (0, 0, 10, 10))
+                    bbox_str = _safe_json_dumps(list(bbox_val))
+                    meas = b_det.get("measurements", {})
+                    meas_str = _safe_json_dumps(meas) if isinstance(meas, dict) else None
+                    create_finding(
+                        job_id=job_id,
+                        type=getattr(item, "type", "pothole"),
+                        severity_label="medium",
+                        severity_score=0.5,
+                        confidence=float(getattr(item, "best_confidence", 0.8)),
+                        status="confirmed",
+                        frame_index=b_fdata.get("index"),
+                        timestamp_s=b_fdata.get("timestamp_s"),
+                        bbox_json=bbox_str,
+                        measurements_json=meas_str,
+                    )
+                elif isinstance(item, dict):
                     bbox = item.get("bbox")
-                    bbox_str = json.dumps(bbox) if isinstance(bbox, (list, dict)) else item.get("bbox_json")
+                    bbox_str = _safe_json_dumps(bbox) if isinstance(bbox, (list, dict)) else item.get("bbox_json")
                     meas = item.get("measurements")
-                    meas_str = json.dumps(meas) if isinstance(meas, dict) else item.get("measurements_json")
+                    meas_str = _safe_json_dumps(meas) if isinstance(meas, dict) else item.get("measurements_json")
 
                     create_finding(
                         job_id=job_id,
@@ -475,7 +556,7 @@ def run_pipeline(job_id: str) -> None:
                 except Exception:
                     current_meas = {}
             current_meas["zoom_key"] = zoom_key
-            new_meas_json = json.dumps(current_meas)
+            new_meas_json = _safe_json_dumps(current_meas)
 
             update_finding(finding["id"], image_key=image_key, crop_key=crop_key, measurements_json=new_meas_json)
 
@@ -499,7 +580,7 @@ def run_pipeline(job_id: str) -> None:
             "by_severity": by_severity,
             "by_status": by_status,
         }
-        summary_json = json.dumps(summary)
+        summary_json = _safe_json_dumps(summary)
 
         # Step 12: Update job status to 'done'
         update_job(job_id, status="done", summary_json=summary_json)

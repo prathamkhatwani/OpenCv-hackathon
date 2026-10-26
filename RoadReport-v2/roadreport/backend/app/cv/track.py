@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -128,20 +128,36 @@ def _template_match_score(prev_frame: np.ndarray, curr_frame: np.ndarray,
         return 0.0
 
 
-def build_tracks(frame_detections: List[Dict], frame_data_list: List[dict]) -> List[Track]:
+def build_tracks(frame_detections: Any, frame_data_list: Any) -> List[Track]:
     """
     Build tracks from per-frame detections using greedy motion-aware linking.
     
     Args:
-        frame_detections: list of lists, one per frame, each containing detection dicts
+        frame_detections: list of lists (one per frame) or flat list of detections
         frame_data_list: list of frame data dicts (with 'frame', 'index', etc.)
     
     Returns:
         List of Track objects. Tracks with >= 3 detections are 'persistent'.
     """
-    if not frame_detections:
+    # Auto-detect if arguments were swapped (e.g. frames passed as first arg)
+    if frame_data_list and isinstance(frame_data_list, list) and isinstance(frame_data_list[0], dict):
+        if 'frame' not in frame_data_list[0] and frame_detections and isinstance(frame_detections, list):
+            if isinstance(frame_detections[0], dict) and 'frame' in frame_detections[0]:
+                frame_detections, frame_data_list = frame_data_list, frame_detections
+
+    if not frame_detections or not frame_data_list:
         return []
-    
+
+    # If frame_detections is a flat list of detection dicts, group by frame
+    if isinstance(frame_detections, list) and frame_detections and isinstance(frame_detections[0], dict):
+        grouped: List[List[Dict]] = [[] for _ in range(len(frame_data_list))]
+        idx_map = {fd.get('index', i): i for i, fd in enumerate(frame_data_list)}
+        for det in frame_detections:
+            f_idx = det.get('frame_index')
+            target_idx = idx_map.get(f_idx, 0 if f_idx is None else min(max(0, f_idx), len(grouped) - 1))
+            grouped[target_idx].append(det)
+        frame_detections = grouped
+
     h, w = frame_data_list[0]['frame'].shape[:2]
     
     active_tracks: List[Track] = []

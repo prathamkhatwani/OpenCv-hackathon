@@ -172,6 +172,18 @@ def run_detector_strict(crop: np.ndarray, det_type: str) -> float:
     return 0.0
 
 
+def _safe_json_dumps(obj: Any) -> str:
+    def _default(o):
+        if isinstance(o, (np.integer, np.int32, np.int64)):
+            return int(o)
+        if isinstance(o, (np.floating, np.float32, np.float64)):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return str(o)
+    return json.dumps(obj, default=_default)
+
+
 def run_agent(
     tracks: list,
     add_step_fn: Callable,
@@ -321,11 +333,11 @@ def run_agent(
                 'status': status,
                 'frame_index': best_fdata['index'],
                 'timestamp_s': best_fdata['timestamp_s'],
-                'bbox_json': json.dumps(list(best_det['bbox'])),
-                'measurements_json': json.dumps(best_det.get('measurements', {})),
+                'bbox_json': _safe_json_dumps(list(best_det['bbox'])),
+                'measurements_json': _safe_json_dumps(best_det.get('measurements', {})),
                 'finding_ref': finding_ref,
                 'frame': best_fdata['frame'],  # For image saving later
-                'bbox': best_det['bbox'],
+                'bbox': [int(v) for v in best_det['bbox']],
             }
 
             finding_id = create_finding_fn(finding)

@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Union
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -200,12 +200,21 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def list_jobs(limit: int = 50) -> List[Dict[str, Any]]:
+    """Retrieve list of recent jobs ordered by created_at descending."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def create_finding(
-    job_id: str,
-    type: str,
-    severity_label: str,
-    severity_score: float,
-    confidence: float,
+    job_id: Union[str, Dict[str, Any]],
+    type: Optional[str] = None,
+    severity_label: Optional[str] = None,
+    severity_score: Optional[float] = None,
+    confidence: Optional[float] = None,
     finding_id: Optional[str] = None,
     status: str = "confirmed",
     frame_index: Optional[int] = None,
@@ -216,7 +225,35 @@ def create_finding(
     measurements_json: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new road damage finding record in the database."""
-    assigned_id = finding_id or uuid.uuid4().hex
+    if isinstance(job_id, dict):
+        d = job_id
+        assigned_id = d.get("id") or d.get("finding_id") or uuid.uuid4().hex
+        real_job_id = d.get("job_id", "")
+        f_type = d.get("type", "pothole")
+        sev_label = d.get("severity_label", "medium")
+        sev_score = float(d.get("severity_score", 0.5))
+        conf = float(d.get("confidence", 0.8))
+        f_status = d.get("status", "confirmed")
+        f_idx = d.get("frame_index")
+        t_s = d.get("timestamp_s")
+        bb_json = d.get("bbox_json") or (json.dumps(d["bbox"]) if "bbox" in d else None)
+        img_key = d.get("image_key")
+        crp_key = d.get("crop_key")
+        meas_json = d.get("measurements_json") or (json.dumps(d["measurements"]) if "measurements" in d else None)
+    else:
+        assigned_id = finding_id or uuid.uuid4().hex
+        real_job_id = job_id
+        f_type = type or "pothole"
+        sev_label = severity_label or "medium"
+        sev_score = float(severity_score if severity_score is not None else 0.5)
+        conf = float(confidence if confidence is not None else 0.8)
+        f_status = status
+        f_idx = frame_index
+        t_s = timestamp_s
+        bb_json = bbox_json
+        img_key = image_key
+        crp_key = crop_key
+        meas_json = measurements_json
 
     query = """
         INSERT INTO findings (
@@ -230,21 +267,20 @@ def create_finding(
             query,
             (
                 assigned_id,
-                job_id,
-                type,
-                severity_label,
-                severity_score,
-                confidence,
-                status,
-                frame_index,
-                timestamp_s,
-                bbox_json,
-                image_key,
-                crop_key,
-                measurements_json,
+                real_job_id,
+                f_type,
+                sev_label,
+                sev_score,
+                conf,
+                f_status,
+                f_idx,
+                t_s,
+                bb_json,
+                img_key,
+                crp_key,
+                meas_json,
             ),
         )
-
     finding = get_finding(assigned_id)
     if finding is None:
         raise RuntimeError(f"Failed to fetch finding immediately after creation: {assigned_id}")

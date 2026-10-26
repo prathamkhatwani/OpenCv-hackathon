@@ -33,8 +33,14 @@ def get_region_name() -> str:
 
 
 def is_local_storage() -> bool:
-    """Check if local storage mode is enabled via environment variable."""
-    return os.getenv("USE_LOCAL_STORAGE", "false").strip().lower() in ("true", "1", "yes")
+    """Check if local storage mode is enabled via environment variable or default to local if AWS credentials are absent."""
+    env_val = os.getenv("USE_LOCAL_STORAGE")
+    if env_val is not None:
+        return env_val.strip().lower() in ("true", "1", "yes")
+    # If AWS credentials or AWS profile are not set, default to local filesystem storage
+    if not os.getenv("AWS_ACCESS_KEY_ID") and not os.getenv("AWS_PROFILE"):
+        return True
+    return False
 
 
 def get_local_storage_dir() -> Path:
@@ -85,7 +91,13 @@ def upload_file(local_path: str, s3_key: str) -> str:
         client.upload_file(local_path, bucket, s3_key)
         logger.info("Uploaded %s to s3://%s/%s", local_path, bucket, s3_key)
         return s3_key
-    except (ClientError, BotoCoreError) as e:
+    except Exception as e:
+        if "NoCredentialsError" in type(e).__name__ or "Unable to locate credentials" in str(e):
+            logger.warning("AWS credentials not found. Seamlessly saving file locally for key %s", s3_key)
+            dest_path = _get_local_dest_path(s3_key)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(local_path, dest_path)
+            return s3_key
         logger.error("Failed to upload %s to s3://%s/%s: %s", local_path, bucket, s3_key, e)
         raise
 
@@ -119,7 +131,13 @@ def upload_bytes(data: bytes, s3_key: str, content_type: str = "application/octe
         )
         logger.info("Uploaded %d bytes to s3://%s/%s", len(data), bucket, s3_key)
         return s3_key
-    except (ClientError, BotoCoreError) as e:
+    except Exception as e:
+        if "NoCredentialsError" in type(e).__name__ or "Unable to locate credentials" in str(e):
+            logger.warning("AWS credentials not found. Seamlessly saving bytes locally for key %s", s3_key)
+            dest_path = _get_local_dest_path(s3_key)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(data)
+            return s3_key
         logger.error("Failed to upload bytes to s3://%s/%s: %s", bucket, s3_key, e)
         raise
 
@@ -147,7 +165,10 @@ def presign_get(s3_key: str, expires: int = 3600) -> str:
             ExpiresIn=expires,
         )
         return str(url)
-    except (ClientError, BotoCoreError) as e:
+    except Exception as e:
+        if "NoCredentialsError" in type(e).__name__ or "Unable to locate credentials" in str(e):
+            dest_path = _get_local_dest_path(s3_key).resolve()
+            return dest_path.as_uri()
         logger.error("Failed to generate presigned GET URL for s3://%s/%s: %s", bucket, s3_key, e)
         raise
 
@@ -175,6 +196,13 @@ def download_file(s3_key: str, local_path: str) -> None:
         client = get_s3_client()
         client.download_file(bucket, s3_key, str(dest))
         logger.info("Downloaded s3://%s/%s to %s", bucket, s3_key, dest)
-    except (ClientError, BotoCoreError) as e:
+    except Exception as e:
+        if "NoCredentialsError" in type(e).__name__ or "Unable to locate credentials" in str(e):
+            src_path = _get_local_dest_path(s3_key)
+            if src_path.exists():
+                shutil.copyfile(src_path, dest)
+                logger.info("Copied fallback local storage file from %s to %s", src_path, dest)
+                return
         logger.error("Failed to download s3://%s/%s to %s: %s", bucket, s3_key, dest, e)
         raise
+
