@@ -1,9 +1,9 @@
 import {useEffect,useRef,useMemo} from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-export default function RouteMap({samples,offset=0,time=0}){
- const box=useRef(null),map=useRef(null),marker=useRef(null);
- const gps=useMemo(()=>samples.filter(s=>s.lat!=null&&s.lon!=null),[samples]);
+ export default function RouteMap({samples=[],offset=0,time=0}){
+  const box=useRef(null),map=useRef(null),marker=useRef(null);
+  const gps=useMemo(()=>(samples||[]).filter(s=>s && s.lat!=null&&s.lon!=null),[samples]);
  useEffect(()=>{
   if(!box.current||gps.length<2)return;
   const m=L.map(box.current);map.current=m;

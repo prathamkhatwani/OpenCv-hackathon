@@ -1,6 +1,6 @@
 export default function EvidenceChart({motion=[],telemetry,time,duration,onSeek,contact,synthetic=false}){
- const width=900,height=190,pad=36,d=Math.max(duration,1),offset=telemetry?.time_offset_s||0;
- const camera=motion.filter(s=>s.quality>=.55),imu=(telemetry?.samples||[]).filter(s=>s.az!=null);
+ const width=900,height=190,pad=36,d=Math.max(duration||1,1),offset=telemetry?.time_offset_s||0;
+ const camera=(motion||[]).filter(s=>s&&s.quality>=.55),imu=(telemetry?.samples||[]).filter(s=>s&&s.az!=null);
  const x=t=>pad+t/d*(width-pad*2);
  const points=(rows,fn)=>rows.map(s=>`${x(s.t+(fn==='az'?offset:0))},${fn==='az'?145-Math.max(-10,Math.min(10,s.az))*3:80-Math.min(10,s.motion_score)*5}`).join(' ');
  return <div className="chart"><div className="row spread"><b>{synthetic?'Scripted camera motion':'Motion evidence'}</b><small>{synthetic?'Click to seek • orange: simulated pulse score':'Click to seek • orange: camera score • teal: vertical IMU (m/s²)'}</small></div>
