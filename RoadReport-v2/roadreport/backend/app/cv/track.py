@@ -56,172 +56,79 @@ class Track:
         self.frame_data_list.append(frame_data)
 
 
-def _can_link(prev_det: Dict, curr_det: Dict, frame_h: int, frame_w: int) -> bool:
-    """
-    Check if two detections across consecutive sampled frames can be linked.
-    On a moving camera, real defects drift downward and x stays roughly stable.
-    """
-    dx = abs(curr_det['center_x'] - prev_det['center_x'])
-    dy = curr_det['center_y'] - prev_det['center_y']  # Should be positive (moving down)
-    
-    # x stability check
-    if dx > 0.12 * frame_w:
-        return False
-    
-    # Downward motion check
-    if dy <= 0 or dy > 0.35 * frame_h:
-        return False
-    
-    # Area ratio check (grows as it gets closer)
-    prev_bbox = prev_det['bbox']
-    curr_bbox = curr_det['bbox']
-    prev_area = prev_bbox[2] * prev_bbox[3]
-    curr_area = curr_bbox[2] * curr_bbox[3]
-    ratio = curr_area / max(prev_area, 1)
-    if ratio < 0.8 or ratio > 2.5:
-        return False
-    
-    return True
+def _iou(a, b):
+    x, y = max(a[0], b[0]), max(a[1], b[1])
+    right, bottom = min(a[0]+a[2], b[0]+b[2]), min(a[1]+a[3], b[1]+b[3])
+    intersection = max(0, right-x)*max(0, bottom-y)
+    return intersection/max(a[2]*a[3]+b[2]*b[3]-intersection, 1)
 
 
-def _template_match_score(prev_frame: np.ndarray, curr_frame: np.ndarray,
-                           prev_bbox: tuple, curr_bbox: tuple) -> float:
-    """
-    Use template matching as tiebreaker between candidate links.
-    Returns TM_CCOEFF_NORMED score.
-    """
-    px, py, pw, ph = prev_bbox
-    # Extract crop from previous frame as template
-    template = prev_frame[py:py+ph, px:px+pw]
-    if template.size == 0 or min(template.shape[:2]) < 5:
-        return 0.0
-    
-    # Search region in current frame (expanded area around current bbox)
-    cx, cy, cw, ch = curr_bbox
-    pad = max(cw, ch) // 2
-    sy = max(0, cy - pad)
-    sx = max(0, cx - pad)
-    ey = min(curr_frame.shape[0], cy + ch + pad)
-    ex = min(curr_frame.shape[1], cx + cw + pad)
-    search_region = curr_frame[sy:ey, sx:ex]
-    
-    if (search_region.shape[0] < template.shape[0] or 
-        search_region.shape[1] < template.shape[1]):
-        # Resize template to fit
-        template = cv2.resize(template, (min(template.shape[1], search_region.shape[1]),
-                                          min(template.shape[0], search_region.shape[0])))
-    
-    if template.size == 0 or search_region.size == 0:
-        return 0.0
-    
-    try:
-        # Convert to grayscale for matching
-        if len(template.shape) == 3:
-            template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-        if len(search_region.shape) == 3:
-            search_region = cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY)
-        
-        result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(result)
-        return float(max_val)
-    except cv2.error:
-        return 0.0
+def _predict(track, timestamp):
+    last = np.array(track.last_detection()['bbox'], dtype=float)
+    if track.n < 2:
+        return last
+    dt = track.frame_data_list[-1]['timestamp_s']-track.frame_data_list[-2]['timestamp_s']
+    if dt <= 0:
+        return last
+    velocity = (last-np.array(track.detections[-2]['bbox']))/dt
+    prediction = last+velocity*min(timestamp-track.last_frame_data()['timestamp_s'], .75)
+    prediction[2:] = np.maximum(prediction[2:], 5)
+    return prediction
 
 
-def build_tracks(frame_detections: Any, frame_data_list: Any) -> List[Track]:
-    """
-    Build tracks from per-frame detections using greedy motion-aware linking.
-    
-    Args:
-        frame_detections: list of lists (one per frame) or flat list of detections
-        frame_data_list: list of frame data dicts (with 'frame', 'index', etc.)
-    
-    Returns:
-        List of Track objects. Tracks with >= 3 detections are 'persistent'.
-    """
-    # Auto-detect if arguments were swapped (e.g. frames passed as first arg)
-    if frame_data_list and isinstance(frame_data_list, list) and isinstance(frame_data_list[0], dict):
-        if 'frame' not in frame_data_list[0] and frame_detections and isinstance(frame_detections, list):
-            if isinstance(frame_detections[0], dict) and 'frame' in frame_detections[0]:
-                frame_detections, frame_data_list = frame_data_list, frame_detections
+def build_tracks(frame_detections, frame_data_list, max_gap_s=1.0):
+    """One-to-one motion association, tolerant of stopped cameras and missed frames.
 
-    if not frame_detections or not frame_data_list:
+    IDs are job-local. Re-identification beyond max_gap_s is deliberately not
+    assumed: pixel coordinates alone cannot identify a road on a later visit.
+    """
+    from scipy.optimize import linear_sum_assignment
+    if not frame_data_list:
         return []
-
-    # If frame_detections is a flat list of detection dicts, group by frame
-    if isinstance(frame_detections, list) and frame_detections and isinstance(frame_detections[0], dict):
-        grouped: List[List[Dict]] = [[] for _ in range(len(frame_data_list))]
-        idx_map = {fd.get('index', i): i for i, fd in enumerate(frame_data_list)}
+    if frame_detections and isinstance(frame_detections[0], dict):
+        by_index = {f['index']: [] for f in frame_data_list}
         for det in frame_detections:
-            f_idx = det.get('frame_index')
-            target_idx = idx_map.get(f_idx, 0 if f_idx is None else min(max(0, f_idx), len(grouped) - 1))
-            grouped[target_idx].append(det)
-        frame_detections = grouped
-
-    h, w = frame_data_list[0]['frame'].shape[:2]
-    
-    active_tracks: List[Track] = []
-    finished_tracks: List[Track] = []
-    
-    for frame_idx, (detections, fdata) in enumerate(zip(frame_detections, frame_data_list)):
-        used_detections = set()
-        
-        # Try to extend existing tracks
-        for track in active_tracks:
-            best_match_idx = -1
-            best_score = -1
-            
-            last_det = track.last_detection()
-            
-            for det_idx, det in enumerate(detections):
-                if det_idx in used_detections:
-                    continue
+            if det.get('frame_index') in by_index:
+                by_index[det['frame_index']].append(det)
+        frame_detections = [by_index[f['index']] for f in frame_data_list]
+    if len(frame_detections) != len(frame_data_list):
+        raise ValueError('Every sampled frame must have a detection list (possibly empty)')
+    active, finished = [], []
+    next_id = 1
+    for detections, frame in zip(frame_detections, frame_data_list):
+        timestamp = frame['timestamp_s']
+        alive = []
+        for track in active:
+            if timestamp-track.last_frame_data()['timestamp_s'] <= max_gap_s:
+                alive.append(track)
+            else:
+                finished.append(track)
+        active = alive
+        costs = np.full((len(active), len(detections)), 1e6)
+        for i, track in enumerate(active):
+            prediction = _predict(track, timestamp)
+            for j, det in enumerate(detections):
                 if det['type'] != track.type:
                     continue
-                if not _can_link(last_det, det, h, w):
-                    continue
-                
-                # Use template matching as tiebreaker
-                score = _template_match_score(
-                    track.last_frame_data()['frame'],
-                    fdata['frame'],
-                    last_det['bbox'],
-                    det['bbox']
-                )
-                
-                if score > best_score and score >= 0.5:
-                    best_score = score
-                    best_match_idx = det_idx
-                elif score < 0.5 and best_match_idx == -1:
-                    # Accept without template match if it's the only spatial candidate
-                    best_match_idx = det_idx
-                    best_score = score
-            
-            if best_match_idx >= 0:
-                track.add(detections[best_match_idx], fdata)
-                used_detections.add(best_match_idx)
-        
-        # Move tracks that weren't extended to finished
-        still_active = []
-        for track in active_tracks:
-            if track.last_frame_data().get('index') == fdata.get('index'):
-                still_active.append(track)
-            else:
-                finished_tracks.append(track)
-        active_tracks = still_active
-        
-        # Start new tracks for unmatched detections
-        for det_idx, det in enumerate(detections):
-            if det_idx not in used_detections:
-                active_tracks.append(Track(det, fdata))
-    
-    # Finish remaining active tracks
-    finished_tracks.extend(active_tracks)
-    
-    # Sort by best confidence descending
-    finished_tracks.sort(key=lambda t: t.best_confidence, reverse=True)
-    
-    logger.info(f"Built {len(finished_tracks)} tracks, "
-                f"{sum(1 for t in finished_tracks if t.n >= 3)} persistent (3+ frames)")
-    
-    return finished_tracks
+                box = np.asarray(det['bbox'], dtype=float)
+                ratio = box[2]*box[3]/max(prediction[2]*prediction[3], 1)
+                distance = np.linalg.norm((box[:2]+box[2:]/2)-(prediction[:2]+prediction[2:]/2))
+                scale = max(np.linalg.norm(prediction[2:]), np.linalg.norm(box[2:]), 20)
+                overlap = _iou(prediction, box)
+                # No one-way vertical-motion assumption: stops, turns and jitter are valid.
+                if .3 <= ratio <= 3.3 and (overlap >= .08 or distance/scale <= .75):
+                    costs[i,j] = 1-overlap + .4*distance/scale + .1*abs(np.log(ratio))
+        used = set()
+        if costs.size:
+            rows, cols = linear_sum_assignment(costs)
+            for i,j in zip(rows, cols):
+                if costs[i,j] < 1e6:
+                    active[i].add(detections[j], frame)
+                    used.add(j)
+        for j, det in enumerate(detections):
+            if j not in used:
+                track = Track(det, frame)
+                track.track_id = next_id
+                next_id += 1
+                active.append(track)
+    return sorted(finished+active, key=lambda t: t.track_id)

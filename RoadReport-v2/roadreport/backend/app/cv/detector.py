@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
@@ -38,8 +39,8 @@ CLASS_TO_SUBTYPE = {
 class YOLODetector:
     """YOLOv8 detector using OpenCV DNN backend."""
     
-    def __init__(self, model_path: Optional[str] = None, conf_threshold: float = 0.18,
-                 nms_threshold: float = 0.60, input_size: int = 640):
+    def __init__(self, model_path: Optional[str] = None, conf_threshold: float = 0.20,
+                 nms_threshold: float = 0.45, input_size: int = 640):
         """
         Initialize YOLO detector.
         
@@ -57,6 +58,7 @@ class YOLODetector:
         self.nms_threshold = nms_threshold
         self.input_size = input_size
         self.net = None
+        self._inference_lock = threading.Lock()
         self._load_model()
     
     def _load_model(self):
@@ -83,6 +85,11 @@ class YOLODetector:
         else:
             self.metadata = {}
         
+        classes = self.metadata.get('classes')
+        if classes:
+            ordered = [classes.get(str(i), classes.get(i)) for i in range(len(classes))] if isinstance(classes, dict) else classes
+            if ordered != CLASS_NAMES:
+                raise ValueError('Model class order differs from RDD2022; refusing incorrect labels')
         logger.info("YOLO detector loaded successfully")
     
     def _preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
@@ -172,12 +179,17 @@ class YOLODetector:
         
         # OpenCV NMS
         boxes_for_nms = np.column_stack([x1, y1, widths, heights]).tolist()
-        indices = cv2.dnn.NMSBoxes(boxes_for_nms, max_scores.tolist(),
-                                    self.conf_threshold, self.nms_threshold)
+        indices = []
+        for cls in np.unique(class_ids):
+            candidates = np.where(class_ids == cls)[0]
+            kept = cv2.dnn.NMSBoxes([boxes_for_nms[k] for k in candidates],
+                                   max_scores[candidates].tolist(),
+                                   self.conf_threshold, self.nms_threshold)
+            indices.extend(candidates[np.asarray(kept, dtype=int).reshape(-1)].tolist())
         
         detections = []
         if len(indices) > 0:
-            for i in indices.flatten():
+            for i in indices:
                 bx = int(round(x1[i]))
                 by = int(round(y1[i]))
                 bw = int(round(widths[i]))
@@ -216,11 +228,7 @@ class YOLODetector:
                 }
                 
                 # Add type-specific measurements
-                if det_type == 'pothole':
-                    detection['measurements']['solidity'] = 0.9  # placeholder
-                    detection['measurements']['contrast'] = 40.0  # placeholder
-                    detection['measurements']['ring_edge'] = 0.2  # placeholder
-                elif det_type == 'crack':
+                if det_type == 'crack':
                     detection['measurements']['length_px'] = max(bw, bh)
                     detection['measurements']['elongation'] = round(max(bw, bh) / max(min(bw, bh), 1), 2)
                     detection['measurements']['mean_width_px'] = round(min(bw, bh), 2)
@@ -253,8 +261,9 @@ class YOLODetector:
         blob, ratio, dw, dh = self._preprocess(frame)
         
         # Inference
-        self.net.setInput(blob)
-        output = self.net.forward()
+        with self._inference_lock:
+            self.net.setInput(blob)
+            output = self.net.forward()
         
         # Postprocess
         detections = self._postprocess(output, ratio, dw, dh, orig_h, orig_w)
@@ -293,13 +302,15 @@ class YOLODetector:
 
 # Global detector instance (lazy loaded)
 _detector: Optional[YOLODetector] = None
+_detector_lock = threading.Lock()
 
 
 def get_detector(model_path: Optional[str] = None) -> YOLODetector:
     """Get or create the global YOLO detector instance."""
     global _detector
-    if _detector is None:
-        _detector = YOLODetector(model_path=model_path)
+    with _detector_lock:
+        if _detector is None:
+            _detector = YOLODetector(model_path=model_path)
     return _detector
 
 

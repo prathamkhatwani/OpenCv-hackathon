@@ -169,6 +169,79 @@ def _invoke_tracker(
     return raw_tracks if isinstance(raw_tracks, list) else [raw_tracks]
 
 
+def _deduplicate_tracks(
+    tracks: List[Any],
+    max_gap_s: float = 2.5,
+    min_iou: float = 0.15,
+    max_dist: float = 90.0,
+) -> List[Any]:
+    """Merge fragmented tracks belonging to the same physical road defect."""
+    if not tracks:
+        return []
+
+    def _track_iou(a, b):
+        x, y = max(a[0], b[0]), max(a[1], b[1])
+        right, bottom = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+        inter = max(0, right - x) * max(0, bottom - y)
+        return inter / max(a[2] * a[3] + b[2] * b[3] - inter, 1)
+
+    def get_start_t(t):
+        if hasattr(t, "frame_data_list") and t.frame_data_list:
+            return t.frame_data_list[0].get("timestamp_s", 0.0)
+        return 0.0
+
+    sorted_tracks = sorted(tracks, key=get_start_t)
+    merged: List[Any] = []
+
+    for t in sorted_tracks:
+        if not hasattr(t, "detections") or not t.detections:
+            continue
+        matched = False
+        t_start = t.frame_data_list[0]["timestamp_s"]
+        t_first_box = t.detections[0]["bbox"]
+        t_first_c = (t_first_box[0] + t_first_box[2] / 2, t_first_box[1] + t_first_box[3] / 2)
+
+        for m in merged:
+            if m.type != t.type:
+                continue
+            m_end = m.frame_data_list[-1]["timestamp_s"]
+            dt = t_start - m_end
+            if dt < -0.1:  # Temporal overlap
+                iou_best = _track_iou(m.best_bbox, t.best_bbox)
+                c_m = (m.best_bbox[0] + m.best_bbox[2] / 2, m.best_bbox[1] + m.best_bbox[3] / 2)
+                c_t = (t.best_bbox[0] + t.best_bbox[2] / 2, t.best_bbox[1] + t.best_bbox[3] / 2)
+                dist_best = float(np.hypot(c_m[0] - c_t[0], c_m[1] - c_t[1]))
+                if iou_best >= min_iou or dist_best <= max_dist:
+                    existing_indices = {fd["index"] for fd in m.frame_data_list}
+                    for d, fd in zip(t.detections, t.frame_data_list):
+                        if fd["index"] not in existing_indices:
+                            m.add(d, fd)
+                            existing_indices.add(fd["index"])
+                    matched = True
+                    break
+            elif 0 <= dt <= max_gap_s:  # Forward travel sequence
+                m_last_box = m.detections[-1]["bbox"]
+                m_last_c = (m_last_box[0] + m_last_box[2] / 2, m_last_box[1] + m_last_box[3] / 2)
+                iou_edge = _track_iou(m_last_box, t_first_box)
+                dist_edge = float(np.hypot(m_last_c[0] - t_first_c[0], m_last_c[1] - t_first_c[1]))
+                if iou_edge >= min_iou or dist_edge <= max_dist:
+                    for d, fd in zip(t.detections, t.frame_data_list):
+                        m.add(d, fd)
+                    matched = True
+                    break
+        if not matched:
+            merged.append(t)
+
+    for idx, m in enumerate(merged):
+        combined = list(zip(m.detections, m.frame_data_list))
+        combined.sort(key=lambda pair: pair[1]["timestamp_s"])
+        m.detections = [p[0] for p in combined]
+        m.frame_data_list = [p[1] for p in combined]
+        m.track_id = idx + 1
+
+    return merged
+
+
 def _invoke_agent(
     agent_func: Callable,
     job_id: str,
@@ -425,77 +498,29 @@ def run_pipeline(job_id: str) -> None:
         # Step 4: Update frames_total in DB
         update_job(job_id, frames_total=frames_count, frames_used=frames_count, frames_done=0)
 
-        # Step 5, 6, 7: Detection per frame with progress tracking
+        # Supervised detector is mandatory: never silently substitute dark patches.
+        from app.cv.detector import get_detector
+        detector = get_detector()
         all_detections: List[Dict[str, Any]] = []
         for i, frame_item in enumerate(frames):
-            potholes = _invoke_detector(detect_potholes, frame_item)
-            for p in potholes:
-                if isinstance(p, dict):
-                    p.setdefault("type", "pothole")
-                    all_detections.append(p)
-
-            cracks = _invoke_detector(detect_cracks, frame_item)
-            for c in cracks:
-                if isinstance(c, dict):
-                    c.setdefault("type", "crack")
-                    all_detections.append(c)
-
-            # Step 7: Update progress
+            for det in detector.detect(frame_item['frame'], frame_item['roi_mask']):
+                det['frame_index'] = frame_item['index']
+                det['timestamp_s'] = frame_item['timestamp_s']
+                all_detections.append(det)
             update_job(job_id, frames_done=i + 1)
 
         logger.info("Completed detection across %d frames: %d raw detections", frames_count, len(all_detections))
 
         # Step 8: Multi-frame tracking
         tracks = _invoke_tracker(build_tracks, frames, all_detections)
-        logger.info("Multi-frame tracking produced %d tracks", len(tracks))
+        logger.info("Multi-frame tracking produced %d raw tracks", len(tracks))
+        tracks = _deduplicate_tracks(tracks)
+        logger.info("After spatial-temporal deduplication: %d unique defect tracks", len(tracks))
 
         # Step 9: Agent loop
         agent_result = _invoke_agent(run_agent, job_id, tracks, frames)
 
-        # Ensure findings exist in DB
-        existing_findings = get_findings(job_id)
-        if not existing_findings:
-            source_findings = agent_result if (isinstance(agent_result, list) and agent_result) else tracks
-            for item in source_findings:
-                if hasattr(item, "best_detection"):
-                    b_det = item.best_detection
-                    b_fdata = item.best_frame_data
-                    bbox_val = b_det.get("bbox", (0, 0, 10, 10))
-                    bbox_str = _safe_json_dumps(list(bbox_val))
-                    meas = b_det.get("measurements", {})
-                    meas_str = _safe_json_dumps(meas) if isinstance(meas, dict) else None
-                    create_finding(
-                        job_id=job_id,
-                        type=getattr(item, "type", "pothole"),
-                        severity_label="medium",
-                        severity_score=0.5,
-                        confidence=float(getattr(item, "best_confidence", 0.8)),
-                        status="confirmed",
-                        frame_index=b_fdata.get("index"),
-                        timestamp_s=b_fdata.get("timestamp_s"),
-                        bbox_json=bbox_str,
-                        measurements_json=meas_str,
-                    )
-                elif isinstance(item, dict):
-                    bbox = item.get("bbox")
-                    bbox_str = _safe_json_dumps(bbox) if isinstance(bbox, (list, dict)) else item.get("bbox_json")
-                    meas = item.get("measurements")
-                    meas_str = _safe_json_dumps(meas) if isinstance(meas, dict) else item.get("measurements_json")
-
-                    create_finding(
-                        job_id=job_id,
-                        type=item.get("type", "pothole"),
-                        severity_label=item.get("severity_label", "medium"),
-                        severity_score=float(item.get("severity_score", 0.5)),
-                        confidence=float(item.get("confidence", 0.8)),
-                        status=item.get("status", "confirmed"),
-                        frame_index=item.get("frame_index"),
-                        timestamp_s=item.get("timestamp_s"),
-                        bbox_json=bbox_str,
-                        image_key=item.get("image_key"),
-                        crop_key=item.get("crop_key"),
-                        measurements_json=meas_str,
-                    )
+        # An empty agent result is valid. Never resurrect dismissed tracks.
 
         # Refresh findings list
         findings = get_findings(job_id)
@@ -574,7 +599,15 @@ def run_pipeline(job_id: str) -> None:
             by_severity[s] = by_severity.get(s, 0) + 1
             by_status[st] = by_status.get(st, 0) + 1
 
+        capture = cv2.VideoCapture(local_video_path)
+        fps = capture.get(cv2.CAP_PROP_FPS) or 30
+        video_meta = {"width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                      "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                      "fps": fps, "duration_s": capture.get(cv2.CAP_PROP_FRAME_COUNT)/fps}
+        capture.release()
         summary = {
+            "video": video_meta,
+            "detector": detector.info(),
             "total_findings": len(final_findings),
             "by_type": by_type,
             "by_severity": by_severity,

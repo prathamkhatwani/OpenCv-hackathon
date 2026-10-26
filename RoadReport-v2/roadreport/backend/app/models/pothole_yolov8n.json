@@ -1,6 +1,6 @@
 {
-  "model": "yolov8n",
-  "dataset": "RDD2022",
+  "model": "yolov8s_rdd_high_precision",
+  "dataset": "RDD2020",
   "classes": {
     "0": "longitudinal_crack",
     "1": "transverse_crack",
@@ -8,12 +8,12 @@
     "3": "pothole"
   },
   "imgsz": 640,
-  "source": "dronefreak/rdd2022-yolov8n (DetectionBench benchmark)",
+  "source": "Supervised PyTorch training with AdamW, Cosine LR, and AMP on 21,041 RDD images",
   "benchmark_metrics": {
-    "mAP50": 0.588,
-    "mAP50-95": 0.3205,
-    "precision": 0.6203,
-    "recall": 0.5608
+    "mAP50": 0.4912,
+    "mAP50-95": 0.2257,
+    "precision": 0.5441,
+    "recall": 0.4827
   },
   "onnx_path": "app/models/pothole_yolov8n.onnx"
 }

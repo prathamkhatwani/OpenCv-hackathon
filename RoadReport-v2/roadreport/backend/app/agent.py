@@ -231,50 +231,21 @@ def run_agent(
             confidence_after=c
         )
 
-        if c >= HIGH and n >= 2:
-            # High confidence + persistent → confirmed
+        # Scores come only from the supervised model. Enlarging a crop is not
+        # independent evidence and must never increase a classifier score.
+        scores = [float(d['confidence']) for d in detections]
+        strong_observations = sum(score >= .50 for score in scores)
+        if n >= 3 and strong_observations >= 2 and c >= .60:
             status = "confirmed"
-            reason = f"High confidence ({c:.2f}) and persistent ({n} frames)"
-            step_no += 1
-            add_step_fn(job_id, finding_ref, step_no, "confirmed", reason, c, c)
-
-        elif c >= MID:
-            # Medium confidence → re-inspect with 3x zoom
-            crop = pad_crop(best_fdata['frame'], best_det['bbox'], pad=0.25)
-            if crop.size > 0:
-                crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-                crop = unsharp_mask(crop)
-                c2 = run_detector_strict(crop, track_type)
-            else:
-                c2 = 0.0
-
-            step_no += 1
-            add_step_fn(
-                job_id, finding_ref, step_no, "re-inspect",
-                f"3x zoom re-inspection: confidence {c:.2f} → {c2:.2f}",
-                c, c2
-            )
-
-            if c2 >= 0.70 and n >= 3:
-                status = "confirmed"
-                reason = f"Confirmed after re-inspection (c2={c2:.2f}, {n} frames)"
-            elif c2 < LOW and n < 3:
-                status = "dismissed"
-                reason = f"Likely shadow or stain (c2={c2:.2f}, {n} frames)"
-            else:
-                status = "needs_review"
-                reason = f"Evidence still mixed (c2={c2:.2f}, {n} frames)"
-
-            step_no += 1
-            add_step_fn(job_id, finding_ref, step_no, status, reason, c, c2)
-            c = max(c, c2)  # Use best confidence
-
+            reason = f"Supervised detection persists across {n} frames ({strong_observations} strong observations)"
+        elif (n >= 2 and c >= .40) or (n >= 4 and c >= .35):
+            status = "needs_review"
+            reason = f"Repeated visual candidate across {n} frames; queued for review"
         else:
-            # Low confidence → dismissed
             status = "dismissed"
-            reason = f"Below minimum confidence ({c:.2f})"
-            step_no += 1
-            add_step_fn(job_id, finding_ref, step_no, "dismissed", reason, c, c)
+            reason = "Transient or low-confidence candidate"
+        step_no += 1
+        add_step_fn(job_id, finding_ref, step_no, status, reason, c, c)
 
         # Check for blurry best frame - try neighboring frames in track
         if status != "dismissed":
@@ -324,6 +295,20 @@ def run_agent(
 
             severity_score, severity_label = compute_severity(best_det)
 
+            height, width = best_fdata['frame'].shape[:2]
+            measurements = dict(best_det.get('measurements', {}))
+            measurements.update({
+                'track_id': getattr(track, 'track_id', track_idx+1),
+                'track_observations': n,
+                'track_seconds': track_fdata_list[-1]['timestamp_s']-track_fdata_list[0]['timestamp_s'],
+                'reason': reason,
+                'detector': {'detector': 'yolov8n', 'backend': 'OpenCV DNN'},
+                'track': [{'t': f['timestamp_s'],
+                           'box': [d['bbox'][0]/width, d['bbox'][1]/height,
+                                   d['bbox'][2]/width, d['bbox'][3]/height],
+                           'confidence': d['confidence']}
+                          for d, f in zip(detections, track_fdata_list)]
+            })
             finding: Dict[str, Any] = {
                 'job_id': job_id,
                 'type': track_type,
@@ -334,7 +319,7 @@ def run_agent(
                 'frame_index': best_fdata['index'],
                 'timestamp_s': best_fdata['timestamp_s'],
                 'bbox_json': _safe_json_dumps(list(best_det['bbox'])),
-                'measurements_json': _safe_json_dumps(best_det.get('measurements', {})),
+                'measurements_json': _safe_json_dumps(measurements),
                 'finding_ref': finding_ref,
                 'frame': best_fdata['frame'],  # For image saving later
                 'bbox': [int(v) for v in best_det['bbox']],

@@ -250,120 +250,42 @@ def test_api_report_endpoint(monkeypatch):
     assert data["report_key"] == f"jobs/{job['id']}/report.pdf"
 
 
-def test_pipeline_e2e(monkeypatch):
+@pytest.mark.parametrize("confidence, expected", [(0.92, 1), (0.20, 0)])
+def test_pipeline_e2e(monkeypatch, tmp_path, confidence, expected):
     import cv2
     import numpy as np
-    import sys
-    import types
-
-    # 1. Create a dummy test video
-    temp_dir = tempfile.mkdtemp()
-    video_path = os.path.join(temp_dir, "test_input.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(video_path, fourcc, 10.0, (640, 480))
-
-    # Write 15 synthetic frames with high Laplacian variance (sharp road texture)
-    np.random.seed(42)
-    for i in range(15):
-        frame = np.full((480, 640, 3), 100, dtype=np.uint8)
-        # Add random noise so is_blurry is False
-        noise = np.random.randint(0, 50, (480, 640, 3), dtype=np.uint8)
-        frame = cv2.add(frame, noise)
-        # Draw a simulated pothole in lower half
-        cv2.circle(frame, (320, 360), 30, (40, 40, 40), -1)
-        out.write(frame)
-    out.release()
-
-    # Upload video to local storage
-    s3_key = "jobs/test_e2e_job/video.mp4"
-    upload_file(video_path, s3_key)
-
-    # Create job
-    job = create_job(video_key=s3_key, status="uploaded")
-    job_id = job["id"]
-
-    # Mock pothole, crack, track, and agent modules
-    mock_pothole_mod = types.ModuleType("app.cv.pothole")
-    mock_crack_mod = types.ModuleType("app.cv.crack")
-    mock_track_mod = types.ModuleType("app.cv.track")
-    mock_agent_mod = types.ModuleType("app.agent")
-
-    def mock_detect_potholes(frame_dict):
-        return [{
-            "type": "pothole",
-            "bbox": [300, 340, 60, 50],
-            "confidence": 0.92,
-            "severity_score": 0.85,
-            "severity_label": "high",
-            "measurements": {"area_px": 2500, "depth_est_cm": 6.5},
-        }]
-
-    def mock_detect_cracks(frame_dict):
-        return []
-
-    def mock_build_tracks(frames, detections):
-        return [{
-            "type": "pothole",
-            "bbox": [300, 340, 60, 50],
-            "confidence": 0.92,
-            "severity_score": 0.85,
-            "severity_label": "high",
-            "frame_index": 0,
-            "timestamp_s": 0.0,
-            "measurements": {"area_px": 2500, "depth_est_cm": 6.5},
-            "status": "confirmed",
-        }]
-
-    def mock_run_agent(job_id, tracks, frames):
-        add_agent_step(
-            job_id=job_id,
-            finding_ref=None,
-            step_no=1,
-            action="multiframe_pothole_verification",
-            reason="Pothole persisted across frames with consistent shadow depression",
-            confidence_before=0.85,
-            confidence_after=0.92,
-        )
-        return tracks
-
-    mock_pothole_mod.detect_potholes = mock_detect_potholes
-    mock_crack_mod.detect_cracks = mock_detect_cracks
-    mock_track_mod.build_tracks = mock_build_tracks
-    mock_agent_mod.run_agent = mock_run_agent
-
-    monkeypatch.setitem(sys.modules, "app.cv.pothole", mock_pothole_mod)
-    monkeypatch.setitem(sys.modules, "app.cv.crack", mock_crack_mod)
-    monkeypatch.setitem(sys.modules, "app.cv.track", mock_track_mod)
-    monkeypatch.setitem(sys.modules, "app.agent", mock_agent_mod)
-
-    try:
-        # Run orchestrator
-        run_pipeline(job_id)
-
-        # Assert job state
-        finished_job = get_job(job_id)
-        assert finished_job["status"] == "done"
-        assert finished_job["frames_total"] > 0
-        assert finished_job["frames_done"] == finished_job["frames_total"]
-        assert finished_job["summary_json"] is not None
-
-        summary = json.loads(finished_job["summary_json"])
-        assert summary["total_findings"] >= 1
-        assert summary["by_type"]["pothole"] >= 1
-
-        # Assert findings state
-        findings = get_findings(job_id)
-        assert len(findings) >= 1
-        f = findings[0]
-        assert f["image_key"] is not None
-        assert f["crop_key"] is not None
-
-        # Assert agent steps
-        steps = get_agent_steps(job_id)
-        assert len(steps) >= 1
-        assert steps[0]["action"] == "multiframe_pothole_verification"
-
-    finally:
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
+    from app.cv import detector
+    # Only model inference is stubbed; decode, tracking, decisions, database,
+    # annotations and API serialization run for real.
+    path = tmp_path / "input.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 12, (320,240))
+    rng = np.random.default_rng(42)
+    for _ in range(18):
+        writer.write(rng.integers(0,255,(240,320,3),dtype=np.uint8))
+    writer.release()
+    class Detector:
+        def detect(self, image, roi):
+            return [{"type":"pothole", "bbox":(300,400,100,60),
+                     "confidence":confidence,"measurements":{"area_frac":.01}}]
+        def info(self):
+            return {"detector":"test_stub"}
+    monkeypatch.setattr(detector, 'get_detector', lambda:Detector())
+    key = 'jobs/pipeline_regression/video.mp4'
+    upload_file(str(path), key)
+    job = create_job(video_key=key)
+    run_pipeline(job['id'])
+    result = get_job(job['id'])
+    assert result['status']=='done', result.get('error_message')
+    findings = get_findings(job['id'])
+    assert len(findings)==expected
+    summary = json.loads(result['summary_json'])
+    assert summary['total_findings']==expected
+    assert summary['video']['width']==320
+    if expected:
+        assert findings[0]['image_key'] and findings[0]['crop_key']
+        metadata=json.loads(findings[0]['measurements_json'])
+        assert metadata['track_id']==1
+        assert metadata['track_observations']>=3
+        client=TestClient(app)
+        payload=client.get(f"/api/jobs/{job['id']}/findings").json()['findings']
+        assert payload[0]['measurements']['track'][0]['box']==[300/960,400/720,100/960,60/720]

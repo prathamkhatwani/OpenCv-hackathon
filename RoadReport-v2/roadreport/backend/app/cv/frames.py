@@ -6,15 +6,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 def build_roi_mask(height: int, width: int) -> np.ndarray:
-    """Build a trapezoid ROI mask covering the lower 55% of the frame,
-    narrowing toward the horizon.
+    """Build a road ROI mask covering the road surface across full width,
+    preventing edge potholes from being discarded.
     Returns a binary mask (uint8, 0 or 255)."""
     mask = np.zeros((height, width), dtype=np.uint8)
-    # Trapezoid: bottom covers full width, top (at 45% height) covers middle 40%
-    top_y = int(height * 0.45)
+    top_y = int(height * 0.35)
     bottom_y = height
-    top_left = int(width * 0.30)
-    top_right = int(width * 0.70)
+    top_left = int(width * 0.05)
+    top_right = int(width * 0.95)
     pts = np.array([[0, bottom_y], [width, bottom_y], 
                      [top_right, top_y], [top_left, top_y]], dtype=np.int32)
     cv2.fillPoly(mask, [pts], 255)

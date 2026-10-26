@@ -24,9 +24,19 @@ def train(data_yaml: str, epochs: int = 100, imgsz: int = 640, batch: int = 16,
     print(f"  Batch size: {batch}")
     import torch
     if device is None or device == 'auto':
-        device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+        device = 0 if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"  Device: {device}")
     
+    import yaml
+    config = yaml.safe_load(data_path.read_text())
+    expected = ['longitudinal_crack', 'transverse_crack', 'alligator_crack', 'pothole']
+    names = config.get('names', {})
+    names = [names.get(i, names.get(str(i))) for i in range(len(names))] if isinstance(names, dict) else names
+    if names != expected:
+        raise ValueError('Expected RDD2022 classes in order: '+str(expected))
+    if not all(config.get(split) for split in ('train', 'val', 'test')):
+        raise ValueError('Provide separate labeled train, validation and test splits')
+
     # Load pretrained YOLOv8n
     model = YOLO('yolov8n.pt')
     
@@ -38,7 +48,10 @@ def train(data_yaml: str, epochs: int = 100, imgsz: int = 640, batch: int = 16,
         batch=batch,
         device=device,
         workers=4,
-        cache=True,
+        seed=42,
+        deterministic=True,
+        close_mosaic=10,
+        cache=False,
         name='pothole_detector',
         project=output_dir,
         exist_ok=True,
@@ -106,7 +119,7 @@ def train(data_yaml: str, epochs: int = 100, imgsz: int = 640, batch: int = 16,
     print(f"ONNX model exported: {onnx_path}")
     
     # Copy ONNX model to app/models/
-    models_dir = Path(__file__).parent.parent / 'app' / 'models'
+    models_dir = Path(output_dir) / 'candidate_export'
     models_dir.mkdir(parents=True, exist_ok=True)
     dest = models_dir / 'pothole_yolov8n.onnx'
     shutil.copy2(onnx_path, dest)
@@ -119,16 +132,24 @@ def train(data_yaml: str, epochs: int = 100, imgsz: int = 640, batch: int = 16,
         'dataset': 'RDD2022_India',
         'classes': names,
         'imgsz': imgsz,
-        'epochs_trained': epochs,
+        'epochs_requested': epochs,
+        'training_seed': 42,
+        'data_yaml': str(data_path),
+        'deployment': 'candidate_only; validate on target videos before replacing bundled model',
         'onnx_path': str(dest),
     }
     meta_path = models_dir / 'pothole_yolov8n.json'
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"Metadata saved: {meta_path}")
     
+    # Validation is for model development; test remains a final held-out report.
+    validation = best_model.val(data=str(data_path), split='val', conf=.45, iou=.45)
+    meta['validation_metrics'] = {'mAP50': float(validation.box.map50),
+                                  'precision': float(validation.box.mp),
+                                  'recall': float(validation.box.mr)}
     # Validate on test set
     print("\nValidating on test set...")
-    metrics = best_model.val(data=str(data_path), split='test')
+    metrics = best_model.val(data=str(data_path), split='test', conf=.45, iou=.45)
     
     test_metrics = {
         'mAP50': float(metrics.box.map50),
@@ -147,7 +168,7 @@ def train(data_yaml: str, epochs: int = 100, imgsz: int = 640, batch: int = 16,
     meta_path.write_text(json.dumps(meta, indent=2))
     
     print(f"\nTest metrics: {json.dumps(test_metrics, indent=2)}")
-    print(f"\nDone! Model ready at: {dest}")
+    print(f"\nDone! Candidate model (not automatically deployed) at: {dest}")
     
     return str(dest)
 

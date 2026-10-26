@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 from contextlib import asynccontextmanager
 
@@ -151,7 +151,7 @@ async def create_job_endpoint(
             pass
 
     job_id = uuid.uuid4().hex
-    s3_key = f"jobs/{job_id}/video.mp4"
+    s3_key = f"jobs/{job_id}/video{ext}"
 
     temp_dir = tempfile.mkdtemp(prefix=f"roadreport_upload_{job_id}_")
     temp_video_path = os.path.join(temp_dir, f"video{ext}")
@@ -226,6 +226,7 @@ def get_job_endpoint(job_id: str) -> Dict[str, Any]:
         "frames_done": frames_done,
         "progress": progress,
         "summary": summary,
+        "evidence": {"video": summary.get("video", {}), "detector": summary.get("detector", {})} if isinstance(summary, dict) else {},
         "summary_json": job.get("summary_json"),
         "error_message": job.get("error_message"),
     }

@@ -1,31 +1,13 @@
-# RoadReport v2 — evidence before action
+# RoadReport — supervised detection and persistent tracking
 
-A road-inspection prototype that combines visual candidates, estimated tyre paths and time-aligned camera/IMU motion. **A pothole remains a pothole when the wheels miss it.**
+This revision fixes the real upload pipeline, repeated findings and video overlays.
+See `docs/DETECTION-FIXES.md` for verification and limitations. Older architecture
+and training documents describe additional experimental modules; they are not a
+statement that every module is connected to this upload pipeline.
 
-Built from `prathamkhatwani/opencv`, main commit `1826b47ce071d0df907de289084818a39e2d5d41`. The original repository is unchanged. This package replaces the broken integration and demonstration-only results with an explicit evidence workflow.
+## Run on Windows
 
-## Try the included demo
-
-Double-click **START-DEMO.bat** on Windows, or run `npm ci` then `npm run demo` in `roadreport/frontend`. It opens the explicit 18-second synthetic simulation at http://127.0.0.1:5173/?demo=1 . No backend is required. See [DEMO.md](DEMO.md) for the three cases, controls and asset provenance.
-
-## What is implemented
-
-- OpenCV 5 classical pothole/crack detection, temporal tracks, stable finding IDs and per-finding action traces.
-- Native-frame optical-flow motion analysis, independent of the 4 fps sharp-frame visual stream.
-- Calibrated straight-road tyre corridors, no-contact classification, predicted front/rear contact windows, and ambiguity handling when several candidates share an impact.
-- Optional time-aligned, gravity-removed vertical IMU evidence. Camera movement is explicitly a proxy, not physical acceleration or proof of wheel contact.
-- Two-head trainable event classifier: visual existence and impact association. Logistic regression versus gradient boosting selection, calibration, grouped splits, JSON model export and inference. Existence uses visual features only so absent shock does not suppress a missed-by-tyres pothole.
-- Adaptive agent action: uncertain observations trigger inspection of three native-resolution neighboring frames; unresolved cases go to human review.
-- Synchronized video, observed boxes, calibrated corridors, motion plots, actual GPS, source labels, evidence crops, saved reviews, inspection history, PDF and JSON exports.
-- Browser camera/sensor recorder; strict sidecar validation; protected evidence URLs; bounded queue and upload sizes; restart recovery; local or private S3 storage.
-
-**Model status:** RDD2022 India is integrated, and a real-data-trained HOG/logistic visual crop classifier is bundled. Its probability appears in finding details, traces and reports as a display-only pilot. It does not replace the classical proposal detector. The separate shock/event fusion model remains `baseline_untrained`: RDD2022 has no synchronized IMU, tyre-contact or impact labels. See [dataset integration and reproduction](docs/RDD2022.md) and the [paired-event training guide](docs/TRAINING.md).
-
-**Not implemented:** curved-path reconstruction, dense segmentation/depth, learned visual proposal detector, fleet consensus, verified repair tracking, cost optimization, or validated Graviton/COOL benchmarks. The original audit lists these as possible follow-up work; they are not hidden behind placeholder UI.
-
-## Start on Windows (PowerShell)
-
-Install Python **3.12** and Node **24**. Extract the ZIP, open its `RoadReport-v2` folder in VS Code, then open a terminal.
+Install Python 3.12 and Node.js 24. Extract the ZIP, open this directory in VS Code.
 
 Backend terminal:
 
@@ -33,10 +15,11 @@ Backend terminal:
 cd roadreport/backend
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+$env:USE_LOCAL_STORAGE="true"
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Frontend terminal, starting from the extracted root:
+Frontend terminal:
 
 ```powershell
 cd roadreport/frontend
@@ -44,38 +27,65 @@ npm ci
 npm run dev
 ```
 
-Open **http://localhost:5173**. The backend must remain running. Upload a 1–60 second video under 100 MB. Telemetry/calibration are optional; missing values remain unknown. `http://127.0.0.1:8000/api/health` should report OpenCV 5. Do not run multiple backend workers.
+Open http://localhost:5173, choose **Inspect**, upload a short road recording and
+wait for analysis to finish. Play the result video: every visible tracked finding
+has a box and stable ID, including findings you have not selected. Green boxes
+are supported findings; amber boxes require review. The finding list has one
+entry per track. Re-analyze older uploads to generate the new track metadata.
 
-Linux/macOS: use `python3.12 -m venv .venv`, then `.venv/bin/python` for backend commands. If a platform has no wheel for a pinned dependency, use Linux x86-64/container; that is the tested runtime. No Windows runtime execution was performed during packaging.
+Linux/macOS: use `python3 -m venv .venv` and `.venv/bin/python` instead.
 
-## Verify locally
+The supplied ONNX weights are already trained on RDD2022. Inference runs through
+OpenCV DNN on CPU; inference does not require PyTorch or a GPU. Missing/corrupt
+weights fail the job rather than falling back to dark-patch detection.
 
-From `roadreport/backend`, using the environment above:
+The **Demo** tab remains a clearly labeled scripted synthetic illustration. Use
+**Inspect** for actual supervised detection. This revision does not turn the
+scripted demo into a real-world accuracy benchmark.
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-```
+## What changed
 
-The full lock includes test/training dependencies. From `roadreport/frontend`, run `npm run build` and `npm run lint`. See [verification record](docs/VERIFICATION.md) for what was actually exercised.
+- Actual uploads now use the bundled supervised YOLO model, once per sampled frame.
+- Global one-to-one motion matching retains identities through stationary frames,
+  upward jitter and short missed-detection gaps (up to one second).
+- Repeated observations produce one persisted finding; nearby separate objects
+  can remain separate tracks.
+- Confirmation requires at least three strong model observations. Interpolating
+  or sharpening a crop cannot artificially raise confidence.
+- The backend saves normalized time-stamped track boxes. The player draws all
+  active findings and interpolates short observed intervals (at most 0.5 seconds).
+- Model inference is locked across concurrent jobs. Same-class NMS suppresses
+  duplicate proposals without suppressing a different damage class.
 
-## Record paired evidence
+## Further supervised training
 
-Use the Capture tab on a phone through **HTTPS** (or localhost on the recording device). Grant camera/motion permissions, fix the phone rigidly, and record ordinary journeys. Never deliberately strike road defects. The recorder stops after 30 seconds and downloads video and sensor JSON separately. Upload both under Inspect. GPS appears only if permission and measurements exist.
-
-Browser sensor/video alignment is approximate. Check the offset and uncertainty; stabilization, mount flex, vehicle suspension, phone orientation and browser sampling affect the signal. No model can establish reliable contact without valid measurements. If a browser recording lacks readable duration metadata, remux it:
+Use a separate training environment with `requirements-training.txt`. Prepare
+labeled RDD2022 data using the existing downloader, or provide the prepared
+archive explicitly:
 
 ```bash
-ffmpeg -i drive.webm -c:v libx264 -pix_fmt yuv420p -an drive.mp4
+python -m pip install -r requirements-training.txt
+python -m tools.download_pothole_dataset --output data/pothole_dataset
+python -m tools.train_yolo --data data/pothole_dataset/data.yaml --epochs 100 --device auto
 ```
 
-Verify that the first-frame time has not shifted relative to telemetry after conversion. Do not silently adjust an offset to manufacture a match.
+The script selects CUDA when available, uses a fixed seed, validates the four
+class names, evaluates validation/test splits separately, and exports to
+`runs/train/candidate_export`. It does not overwrite the shipped model. Review
+held-out results and your own labeled road clips before replacing the matching
+ONNX and JSON pair in `app/models/`. Include negative examples such as shadows,
+patches, drains and manholes; split your own clips by drive/site, not adjacent
+frames. Add their genuine human annotations before training.
 
-## Documentation
+No new detector training run was performed for this ZIP. The supplied weights
+are unchanged; the main correction is that the real pipeline finally uses them.
+There is no measured new precision/recall result for the user's videos.
 
-- [Architecture and decision behavior](docs/ARCHITECTURE.md)
-- [Training, labeling, calibration and evaluation](docs/TRAINING.md)
-- [AWS deployment and submission checklist](docs/DEPLOYMENT.md)
-- [Verification and known limits](docs/VERIFICATION.md)
-- [Original file-by-file audit and proposal](docs/ORIGINAL-AUDIT.md)
+## Verification
 
-Original composite demonstration footage, stock/watermarked scratch images and asset-generation scripts are omitted from this clean release because their provenance was not established. They remain in the original GitHub repository. No private credentials, user footage, database, raw RDD2022 images or node_modules are included. The portable RDD2022 visual pilot weights and measured crop metrics are included. Dependencies retain their upstream licenses; review dataset/media rights and the project's own licensing before public submission.
+Backend: `python -m pytest -q` (install `requirements-dev.txt` first).
+Frontend: `npm run build`, `npm run lint`, `node --test tests/*.test.mjs`.
+
+Tracking is local to a continuous observation. A pothole that fully leaves view
+and is encountered again after a long gap can receive a new ID. Reliable deduplication
+across revisits needs calibrated location or stronger visual re-identification.
