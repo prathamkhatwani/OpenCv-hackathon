@@ -1,6 +1,6 @@
 {
-  "model": "yolov8s_rdd_high_precision",
-  "dataset": "RDD2020",
+  "model": "yolov8s_master_enterprise",
+  "dataset": "RDD2020 + IVCNZ + Smartathon + Muhammad-aa + RoadNegatives (23,279 images)",
   "classes": {
     "0": "longitudinal_crack",
     "1": "transverse_crack",
@@ -8,12 +8,12 @@
     "3": "pothole"
   },
   "imgsz": 640,
-  "source": "Supervised PyTorch training with AdamW, Cosine LR, and AMP on 21,041 RDD images",
+  "source": "Supervised multi-dataset PyTorch enterprise training",
   "benchmark_metrics": {
-    "mAP50": 0.4912,
-    "mAP50-95": 0.2257,
-    "precision": 0.5441,
-    "recall": 0.4827
+    "mAP50": 0.5229,
+    "mAP50-95": 0.2504,
+    "precision": 0.5877,
+    "recall": 0.4995
   },
   "onnx_path": "app/models/pothole_yolov8n.onnx"
 }
